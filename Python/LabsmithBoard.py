@@ -2,10 +2,13 @@ import numpy as np
 import time
 from uProcess_x64 import uProcess_x64
 from datetime import datetime
+import os
 import shutil
 import re
 from CManifold import CManifold
 from CSyringe import CSyringe
+from extra_board_devices import C4AnalogModule, C4PowerModule, CEP01Board
+from output_log import log_directory, output_txt_path
 
 
 class LabsmithBoard:    
@@ -15,8 +18,11 @@ class LabsmithBoard:
         self.MaxNumDev = []
         self.TotNumDev = [] 
         self.eib = [] 
-        self.C4VM = [] 
-        self.SPS01 = [] 
+        self.C4VM = []
+        self.SPS01 = []
+        self.C4AM = np.empty(0, dtype=object)
+        self.C4PM = np.empty(0, dtype=object)
+        self.CEP01 = np.empty(0, dtype=object)
 
         self.eib=uProcess_x64.CEIB()
         self.port = port
@@ -64,7 +70,7 @@ class LabsmithBoard:
     ### Constructor
     def Constructor(self):
         a=self.eib.InitConnection(np.int8(self.port))
-        with open("OUTPUT.txt", "a") as OUTPUT:
+        with open(output_txt_path(), "a") as OUTPUT:
             if a == 0:
                 self.isConnected = True
                 self.isDisconnected = False
@@ -81,14 +87,18 @@ class LabsmithBoard:
     ### Destructor
     def Disconnect(self):
         a=np.int64(self.eib.CloseConnection())
-        with open("OUTPUT.txt", "a") as OUTPUT:
+        with open(output_txt_path(), "a") as OUTPUT:
             if a == 0:
                 self.isConnected = False
                 self.isDisconnected = True
                 self.ClockStopConnection = datetime.now()
-                com= f"Disconnected on {self.ClockStartConnection}"
-                namefile=f"OUTPUT_{self.ClockStartConnection.strftime('%y_%m_%d_%H_%M_%S')}.txt"
-                shutil.copy('OUTPUT.txt', namefile)
+                com= f"Disconnected on {self.ClockStopConnection}"
+                stamp = self.ClockStartConnection or self.ClockStopConnection
+                namefile = os.path.join(
+                    log_directory(),
+                    f"OUTPUT_{stamp.strftime('%y_%m_%d_%H_%M_%S')}.txt",
+                )
+                shutil.copy(output_txt_path(), namefile)
             else:
                 com='Error, still connected'
 
@@ -106,14 +116,25 @@ class LabsmithBoard:
 
         PAT_S="<uProcess.CSyringe>"
         PAT_M="<uProcess.C4VM>"
+        PAT_AM="<uProcess.C4AM>"
+        PAT_PM="<uProcess.C4PM>"
+        PAT_EP="<uProcess.CEP01>"
 
         StrSyringe= [syringe for syringe in splitStr if PAT_S in syringe]
         StrManifold= [manifold for manifold in splitStr if PAT_M in manifold]
+        StrAM = [x for x in splitStr if PAT_AM in x]
+        StrPM = [x for x in splitStr if PAT_PM in x]
+        StrEP = [x for x in splitStr if PAT_EP in x]
+
+        self.C4AM = np.empty(0, dtype=object)
+        self.C4PM = np.empty(0, dtype=object)
+        self.CEP01 = np.empty(0, dtype=object)
 
         if StrManifold:
             PAT = r"address (\d+)"
-            add_man = [re.findall(PAT, Manifold) for Manifold in StrManifold] # OUTPUT 2: add_man =["35", "74"]. It is 2x1 vector containg the addresses of the manifolds on the board
-            add_man = add_man[0]
+            add_man = []
+            for Manifold in StrManifold:
+                add_man.extend(re.findall(PAT, Manifold))
             self.C4VM = np.empty(len(add_man), dtype=object)
             for i, add in enumerate(add_man):
                 self.C4VM[i] = CManifold(self, int(add)) ## it constructs a SPS01 selfect on the specified address. We will use this for the command
@@ -121,12 +142,33 @@ class LabsmithBoard:
 
         if StrSyringe:
             PAT = r"address (\d+)"
-            add_syr = [re.findall(PAT, Syringe) for Syringe in StrSyringe] ## OUTPUT 4: add_syr =[1,3,8,14,26].  It is 5x1 vector containg the addresses of the syringes on the board
-            add_syr = add_syr[0]
+            add_syr = []
+            for Syringe in StrSyringe:
+                add_syr.extend(re.findall(PAT, Syringe))
             self.SPS01 = np.empty(len(add_syr), dtype=object)
             for i, add in enumerate(add_syr):
                 self.SPS01[i] = CSyringe(self, int(add)) ## it constructs a SPS01 selfect on the specified address. We will use this for the command
                 self.SPS01[i].address=int(add)
+
+        addr_pat = re.compile(r"address (\d+)")
+        if StrAM:
+            add_am = [int(x) for x in addr_pat.findall(" ".join(StrAM))]
+            self.C4AM = np.empty(len(add_am), dtype=object)
+            for i, add in enumerate(add_am):
+                self.C4AM[i] = C4AnalogModule(self, add)
+                self.C4AM[i].address = int(add)
+        if StrPM:
+            add_pm = [int(x) for x in addr_pat.findall(" ".join(StrPM))]
+            self.C4PM = np.empty(len(add_pm), dtype=object)
+            for i, add in enumerate(add_pm):
+                self.C4PM[i] = C4PowerModule(self, add)
+                self.C4PM[i].address = int(add)
+        if StrEP:
+            add_ep = [int(x) for x in addr_pat.findall(" ".join(StrEP))]
+            self.CEP01 = np.empty(len(add_ep), dtype=object)
+            for i, add in enumerate(add_ep):
+                self.CEP01[i] = CEP01Board(self, add)
+                self.CEP01[i].address = int(add)
 
     ### Stop
     def StopBoard(self):
@@ -134,62 +176,64 @@ class LabsmithBoard:
             self.SPS01[i].device.CmdStop()
             self.SPS01[i].FlagReady = True
             self.SPS01[i].UpdateStatus()
-            for i in range(len(self.C4VM)):
-                self.C4VM[i].device.CmdStop()
-                self.C4VM[i].UpdateStatus()
-            self.ClockStop = datetime.now()
-            comment = f"{self.ClockStop.strftime('%X')} Interface stopped by the user."
-            with open("OUTPUT.txt", "a") as OUTPUT:
-                OUTPUT.write(comment + "\n")
-                print(comment)
+        for i in range(len(self.C4VM)):
+            self.C4VM[i].device.CmdStop()
+            self.C4VM[i].UpdateStatus()
+        for i in range(len(self.C4AM)):
+            self.C4AM[i].Stop()
+        for i in range(len(self.C4PM)):
+            self.C4PM[i].Stop()
+        for i in range(len(self.CEP01)):
+            self.CEP01[i].Stop()
+        self.ClockStop = datetime.now()
+        comment = f"{self.ClockStop.strftime('%X')} Interface stopped by the user."
+        with open(output_txt_path(), "a") as OUTPUT:
+            OUTPUT.write(comment + "\n")
+            print(comment)
 
     ### Move
     def Move(self, namedevice, flowrate, volume):
         for i in range(len(self.SPS01)):
             if self.SPS01[i].name == namedevice:
                 self.SPS01[i].MoveTo(flowrate,volume)
-            else:
-                with open("OUTPUT.txt", "a") as OUTPUT:
-                    comment='ERROR: Name syringe not correct'
-                    OUTPUT.write(comment + "\n")
-                    print(comment) 
+                return
+        with open(output_txt_path(), "a") as OUTPUT:
+            comment='ERROR: Name syringe not correct'
+            OUTPUT.write(comment + "\n")
+            print(comment)
 
     ### Move2
     def Move2(self, namedevice, flowrate, volume):
         for i in range(len(self.SPS01)):
             if self.SPS01[i].name == namedevice:
                 self.SPS01[i].MoveTo(flowrate,volume)
-            else:
-                with open("OUTPUT.txt", "a") as OUTPUT:
-                    comment='ERROR: Name syringe not correct'
-                    OUTPUT.write(comment + "\n")
-                    print(comment) 
+                return
+        with open(output_txt_path(), "a") as OUTPUT:
+            comment='ERROR: Name syringe not correct'
+            OUTPUT.write(comment + "\n")
+            print(comment)
     
     ### FindIndexS (find index of Syringe from name of device)
     def FindIndexS(self, n):
-        k=[]
-        for i in range(len(self.SPS01)):
-            k.append(self.SPS01[i].name == n)               
-        out = np.nonzero(k)[0][0]
-        if not k:
-            with open("OUTPUT.txt", "a") as OUTPUT:
-                comment=f"Error : {n} does not exist. Check name again."
+        k = [self.SPS01[i].name == n for i in range(len(self.SPS01))]
+        if not any(k):
+            comment = f"Error : {n} does not exist. Check name again."
+            with open(output_txt_path(), "a") as OUTPUT:
                 OUTPUT.write(comment + "\n")
-                print(comment) 
-        return out
-    
+                print(comment)
+            raise ValueError(comment)
+        return int(np.nonzero(k)[0][0])
+
     ### FindIndexM (find index of Manifold from name of device)
     def FindIndexM(self, n):
-        k=[]
-        for i in range(len(self.C4VM)):
-            k.append(self.C4VM[i].name == n)              
-        out = np.nonzero(k)[0][0]
-        if not k:
-            with open("OUTPUT.txt", "a") as OUTPUT:
-                comment=f"Error : {n} does not exist. Check name again."
+        k = [self.C4VM[i].name == n for i in range(len(self.C4VM))]
+        if not any(k):
+            comment = f"Error : {n} does not exist. Check name again."
+            with open(output_txt_path(), "a") as OUTPUT:
                 OUTPUT.write(comment + "\n")
-                print(comment) 
-        return out
+                print(comment)
+            raise ValueError(comment)
+        return int(np.nonzero(k)[0][0])
 
     ### Set Multiple FlowRates (at the same time)
     def SetFlowRate(self, d1 = None, f1 = None, d2 = None, f2 = None, d3 = None, f3 = None, d4 = None, f4 = None, d5 = None, f5 = None, d6 = None, f6 = None, d7 = None, f7 = None, d8 = None, f8 = None):
@@ -721,6 +765,7 @@ class LabsmithBoard:
             if self.SPS01[i1].FlagIsMoving == True:
                 while self.SPS01[i1].FlagIsMoving == True:
                     self.SPS01[i1].UpdateStatus()
+                    time.sleep(0.01)
                 if self.SPS01[i1].FlagIsDone == True:
                     self.SPS01[i1].displaymovementstop()
         elif len(args) == 2:
@@ -731,6 +776,7 @@ class LabsmithBoard:
                 while self.SPS01[i1].FlagIsMoving == True and self.SPS01[i2].FlagIsMoving == True:
                     self.SPS01[i1].UpdateStatus()
                     self.SPS01[i2].UpdateStatus()
+                    time.sleep(0.01)
                 if self.SPS01[i1].FlagIsDone == True or self.SPS01[i2].FlagIsDone == True:
                     for j in range(i[0]):
                         if self.SPS01[i[j]].FlagIsDone == True:
@@ -739,6 +785,7 @@ class LabsmithBoard:
                             a[j]=[]   # # a=[i2] for j=1, a=[i1] for j=2
                             while self.SPS01[a[0]].FlagIsMoving == True:
                                 self.SPS01[a[0]].UpdateStatus()                            
+                                time.sleep(0.01)
                             if self.SPS01[a[0]].FlagIsDone == True:
                                 self.SPS01[a[0]].displaymovementstop()                               
                             break
@@ -752,6 +799,7 @@ class LabsmithBoard:
                     self.SPS01[i1].UpdateStatus() 
                     self.SPS01[i2].UpdateStatus() 
                     self.SPS01[i3].UpdateStatus()
+                    time.sleep(0.01)
                 if self.SPS01[i1].FlagIsDone == True or self.SPS01[i2].FlagIsDone == True or self.SPS01[i3].FlagIsDone == True:
                     for j in range(i[0]):
                         if self.SPS01[i[j]].FlagIsDone == True:
@@ -761,6 +809,7 @@ class LabsmithBoard:
                             while self.SPS01[a[0]].FlagIsMoving == True and self.SPS01[a[1]].FlagIsMoving == True:
                                     self.SPS01[a[0]].UpdateStatus() 
                                     self.SPS01[a[1]].UpdateStatus()
+                                    time.sleep(0.01)
                             if self.SPS01[a[0]].FlagIsDone == True or self.SPS01[a[1]].FlagIsDone == True:
                                 for k in range(a[0]):
                                     if self.SPS01[a[k]].FlagIsDone == True:
@@ -768,8 +817,9 @@ class LabsmithBoard:
                                         b=a 
                                         b[k]=[] 
                                         while self.SPS01[b[0]].FlagIsMoving == True:
-                                            self.SPS01[b[0]].UpdateStatus()                                  
-                                        if self.SPS01[b(1)].FlagIsDone == True:
+                                            self.SPS01[b[0]].UpdateStatus()
+                                            time.sleep(0.01)
+                                        if self.SPS01[b[0]].FlagIsDone == True:
                                             self.SPS01[b[0]].displaymovementstop()                     
                                         break
                             break
@@ -785,6 +835,7 @@ class LabsmithBoard:
                     self.SPS01[i2].UpdateStatus() 
                     self.SPS01[i3].UpdateStatus() 
                     self.SPS01[i4].UpdateStatus()
+                    time.sleep(0.01)
                 if self.SPS01[i1].FlagIsDone == True or self.SPS01[i2].FlagIsDone == True or self.SPS01[i3].FlagIsDone == True or self.SPS01[i4].FlagIsDone == True:
                     for j in range(i[0]):
                         if self.SPS01[i[j]].FlagIsDone == True:
@@ -795,6 +846,7 @@ class LabsmithBoard:
                                     self.SPS01[a[0]].UpdateStatus() 
                                     self.SPS01[a[1]].UpdateStatus() 
                                     self.SPS01[a[2]].UpdateStatus()
+                                    time.sleep(0.01)
                             if self.SPS01[a[0]].FlagIsDone == True or self.SPS01[a[1]].FlagIsDone == True or self.SPS01[a[2]].FlagIsDone == True:
                                 for k in range(a[0]):
                                     if self.SPS01[a[k]].FlagIsDone == True:
@@ -804,6 +856,7 @@ class LabsmithBoard:
                                         while self.SPS01[b[0]].FlagIsMoving == True and self.SPS01[b[1]].FlagIsMoving == True:
                                             self.SPS01[b[0]].UpdateStatus() 
                                             self.SPS01[b[1]].UpdateStatus()
+                                            time.sleep(0.01)
                                         if self.SPS01[b[0]].FlagIsDone == True or self.SPS01[b[1]].FlagIsDone == True:
                                             for p in range(b[0]):
                                                 if self.SPS01[b[p]].FlagIsDone == True:
@@ -812,6 +865,7 @@ class LabsmithBoard:
                                                     c[p]=[] 
                                                     while self.SPS01[c[0]].FlagIsMoving == True:
                                                         self.SPS01[c[0]].UpdateStatus()
+                                                        time.sleep(0.01)
                                                     if self.SPS01[c[0]].FlagIsDone == True:
                                                         self.SPS01[c[0]].displaymovementstop()
                                                     break
@@ -831,6 +885,7 @@ class LabsmithBoard:
                     self.SPS01[i3].UpdateStatus() 
                     self.SPS01[i4].UpdateStatus() 
                     self.SPS01[i5].UpdateStatus()
+                    time.sleep(0.01)
                 if self.SPS01[i1].FlagIsDone == True or self.SPS01[i2].FlagIsDone == True or self.SPS01[i3].FlagIsDone == True or self.SPS01[i4].FlagIsDone == True or self.SPS01[i5].FlagIsDone == True:
                     for j in range(i[0]):
                         if self.SPS01[i[j]].FlagIsDone == True:
@@ -842,6 +897,7 @@ class LabsmithBoard:
                                     self.SPS01[a[1]].UpdateStatus()
                                     self.SPS01[a[2]].UpdateStatus()
                                     self.SPS01[a[3]].UpdateStatus()
+                                    time.sleep(0.01)
                             if self.SPS01[a[0]].FlagIsDone == True or self.SPS01[a[1]].FlagIsDone == True or self.SPS01[a[2]].FlagIsDone == True or self.SPS01[a[3]].FlagIsDone == True:
                                 for k in range(a[0]):
                                     if self.SPS01[a[k]].FlagIsDone == True:
@@ -852,6 +908,7 @@ class LabsmithBoard:
                                             self.SPS01[b[0]].UpdateStatus()
                                             self.SPS01[b[1]].UpdateStatus()
                                             self.SPS01[b[2]].UpdateStatus()
+                                            time.sleep(0.01)
                                         if self.SPS01[b[0]].FlagIsDone == True or self.SPS01[b[1]].FlagIsDone == True or self.SPS01[b[2]].FlagIsDone == True:
                                             for p in range(b[0]):
                                                 if self.SPS01[b[p]].FlagIsDone == True:
@@ -861,6 +918,7 @@ class LabsmithBoard:
                                                     while self.SPS01[c[0]].FlagIsMoving == True and self.SPS01[c[1]].FlagIsMoving:
                                                         self.SPS01[c[0]].UpdateStatus()
                                                         self.SPS01[c[1]].UpdateStatus()
+                                                        time.sleep(0.01)
                                                     if self.SPS01[c[0]].FlagIsDone == True or self.SPS01[c[1]].FlagIsDone == True:
                                                         for q in range(c[0]):
                                                             if self.SPS01[c[q]].FlagIsDone == True:
@@ -869,6 +927,7 @@ class LabsmithBoard:
                                                                 d[q]=[] 
                                                                 while self.SPS01[d[0]].FlagIsMoving:
                                                                     self.SPS01[d[0]].UpdateStatus()
+                                                                    time.sleep(0.01)
                                                                 if self.SPS01[d[0]].FlagIsDone:
                                                                     self.SPS01[d[0]].displaymovementstop()
                                                                 break
@@ -891,6 +950,7 @@ class LabsmithBoard:
                     self.SPS01[i4].UpdateStatus() 
                     self.SPS01[i5].UpdateStatus() 
                     self.SPS01[i6].UpdateStatus()
+                    time.sleep(0.01)
                 if self.SPS01[i1].FlagIsDone == True or self.SPS01[i2].FlagIsDone == True or self.SPS01[i3].FlagIsDone == True or self.SPS01[i4].FlagIsDone == True or self.SPS01[i5].FlagIsDone == True or self.SPS01[i6].FlagIsDone == True:
                     for j in range(i[0]):
                         if self.SPS01[i[j]].FlagIsDone == True:
@@ -903,6 +963,7 @@ class LabsmithBoard:
                                     self.SPS01[a[2]].UpdateStatus()
                                     self.SPS01[a[3]].UpdateStatus()
                                     self.SPS01[a[4]].UpdateStatus()
+                                    time.sleep(0.01)
                             if self.SPS01[a[0]].FlagIsDone == True or self.SPS01[a[1]].FlagIsDone == True or self.SPS01[a[2]].FlagIsDone == True or self.SPS01[a[3]].FlagIsDone == True or self.SPS01[a[4]].FlagIsDone == True:
                                 for k in range(a[0]):
                                     if self.SPS01[a[k]].FlagIsDone == True:
@@ -914,7 +975,8 @@ class LabsmithBoard:
                                             self.SPS01[b[1]].UpdateStatus()
                                             self.SPS01[b[2]].UpdateStatus()
                                             self.SPS01[b[3]].UpdateStatus()
-                                        if self.SPS01[b[[0]]].FlagIsDone == True or self.SPS01[b[1]].FlagIsDone == True or self.SPS01[b[2]].FlagIsDone == True or self.SPS01[b[3]].FlagIsDone == True:
+                                            time.sleep(0.01)
+                                        if self.SPS01[b[0]].FlagIsDone == True or self.SPS01[b[1]].FlagIsDone == True or self.SPS01[b[2]].FlagIsDone == True or self.SPS01[b[3]].FlagIsDone == True:
                                             for p in range(b[0]):
                                                 if self.SPS01[b[p]].FlagIsDone == True:
                                                     self.SPS01[b[p]].displaymovementstop()
@@ -924,6 +986,7 @@ class LabsmithBoard:
                                                         self.SPS01[c[0]].UpdateStatus()
                                                         self.SPS01[c[1]].UpdateStatus()
                                                         self.SPS01[c[2]].UpdateStatus()
+                                                        time.sleep(0.01)
                                                     if self.SPS01[c[0]].FlagIsDone == True or self.SPS01[c[1]].FlagIsDone == True or self.SPS01[c[2]].FlagIsDone == True:
                                                         for q in range(c[0]):
                                                             if self.SPS01[c[q]].FlagIsDone == True:
@@ -933,6 +996,7 @@ class LabsmithBoard:
                                                                 while self.SPS01[d[0]].FlagIsMoving and self.SPS01[d[1]].FlagIsMoving:
                                                                     self.SPS01[d[0]].UpdateStatus()
                                                                     self.SPS01[d[1]].UpdateStatus()
+                                                                    time.sleep(0.01)
                                                                 if self.SPS01[d[0]].FlagIsDone or self.SPS01[d[1]].FlagIsDone:
                                                                     for r in range(d[0]):
                                                                         if self.SPS01[d[r]].FlagIsDone == True:
@@ -941,8 +1005,9 @@ class LabsmithBoard:
                                                                             e[r]=[]
                                                                             while self.SPS01[e[0]].FlagIsMoving:
                                                                                 self.SPS01[e[0]].UpdateStatus()
+                                                                                time.sleep(0.01)
                                                                             if self.SPS01[e[0]].FlagIsDone:
-                                                                                self.SPS01[e[1]].displaymovementstop()
+                                                                                self.SPS01[e[0]].displaymovementstop()
                                                                             break
                                                                 break
                                                     break
@@ -966,6 +1031,7 @@ class LabsmithBoard:
                     self.SPS01[i5].UpdateStatus() 
                     self.SPS01[i6].UpdateStatus() 
                     self.SPS01[i7].UpdateStatus()
+                    time.sleep(0.01)
                 if self.SPS01[i1].FlagIsDone == True or self.SPS01[i2].FlagIsDone == True or self.SPS01[i3].FlagIsDone == True or self.SPS01[i4].FlagIsDone == True or self.SPS01[i5].FlagIsDone == True or self.SPS01[i6].FlagIsDone == True or self.SPS01[i7].FlagIsDone == True:
                     for j in range(i[0]):
                         if self.SPS01[i[j]].FlagIsDone == True:
@@ -979,6 +1045,7 @@ class LabsmithBoard:
                                     self.SPS01[a[3]].UpdateStatus() 
                                     self.SPS01[a[4]].UpdateStatus() 
                                     self.SPS01[a[5]].UpdateStatus()
+                                    time.sleep(0.01)
                             if self.SPS01[a[0]].FlagIsDone == True or self.SPS01[a[1]].FlagIsDone == True or self.SPS01[a[2]].FlagIsDone == True or self.SPS01[a[3]].FlagIsDone == True or self.SPS01[a[4]].FlagIsDone == True or self.SPS01[a[5]].FlagIsDone == True:
                                 for k in range(a[0]):
                                     if self.SPS01[a[k]].FlagIsDone == True:
@@ -991,6 +1058,7 @@ class LabsmithBoard:
                                             self.SPS01[b[2]].UpdateStatus() 
                                             self.SPS01[b[3]].UpdateStatus() 
                                             self.SPS01[b[4]].UpdateStatus()
+                                            time.sleep(0.01)
                                         if self.SPS01[b[0]].FlagIsDone == True or self.SPS01[b[1]].FlagIsDone == True or self.SPS01[b[2]].FlagIsDone == True or self.SPS01[b[3]].FlagIsDone == True or self.SPS01[b[4]].FlagIsDone == True:
                                             for p in range(b[0]):
                                                 if self.SPS01[b[p]].FlagIsDone == True:
@@ -1002,6 +1070,7 @@ class LabsmithBoard:
                                                         self.SPS01[c[1]].UpdateStatus() 
                                                         self.SPS01[c[2]].UpdateStatus() 
                                                         self.SPS01[c[3]].UpdateStatus()
+                                                        time.sleep(0.01)
                                                     if self.SPS01[c[0]].FlagIsDone == True or self.SPS01[c[1]].FlagIsDone == True or self.SPS01[c[2]].FlagIsDone == True or self.SPS01[c[3]].FlagIsDone == True:
                                                         for q in range(c[0]):
                                                             if self.SPS01[c[q]].FlagIsDone == True:
@@ -1012,6 +1081,7 @@ class LabsmithBoard:
                                                                     self.SPS01[d[0]].UpdateStatus() 
                                                                     self.SPS01[d[1]].UpdateStatus() 
                                                                     self.SPS01[d[2]].UpdateStatus()
+                                                                    time.sleep(0.01)
                                                                 if self.SPS01[d[0]].FlagIsDone or self.SPS01[d[1]].FlagIsDone or self.SPS01[d[2]].FlagIsDone:
                                                                     for r in range(d[0]):
                                                                         if self.SPS01[d[r]].FlagIsDone == True:
@@ -1021,6 +1091,7 @@ class LabsmithBoard:
                                                                             while self.SPS01[e[0]].FlagIsMoving and self.SPS01[e[1]].FlagIsMoving:
                                                                                 self.SPS01[e[0]].UpdateStatus()
                                                                                 self.SPS01[e[1]].UpdateStatus()
+                                                                                time.sleep(0.01)
                                                                             if self.SPS01[e[0]].FlagIsDone or self.SPS01[e[1]].FlagIsDone:
                                                                                 for s in range(e[0]):
                                                                                     if self.SPS01[e[s]].FlagIsDone == True:
@@ -1029,6 +1100,7 @@ class LabsmithBoard:
                                                                                         f[s]=[] 
                                                                                         while self.SPS01[f[0]].FlagIsMoving:
                                                                                             self.SPS01[f[0]].UpdateStatus()
+                                                                                            time.sleep(0.01)
                                                                                         if self.SPS01[f[0]].FlagIsDone:
                                                                                             self.SPS01[f[0]].displaymovementstop()
                                                                                         break
@@ -1056,9 +1128,10 @@ class LabsmithBoard:
                     self.SPS01[i6].UpdateStatus() 
                     self.SPS01[i7].UpdateStatus() 
                     self.SPS01[i8].UpdateStatus()
+                    time.sleep(0.01)
                 if self.SPS01[i1].FlagIsDone == True or self.SPS01[i2].FlagIsDone == True or self.SPS01[i3].FlagIsDone == True or self.SPS01[i4].FlagIsDone == True or self.SPS01[i5].FlagIsDone == True or self.SPS01[i6].FlagIsDone == True or self.SPS01[i7].FlagIsDone == True or self.SPS01[i8].FlagIsDone == True:
                     for j in range(i[0]):
-                        if self.SPS01[i(j)].FlagIsDone == True:
+                        if self.SPS01[i[j]].FlagIsDone == True:
                             self.SPS01[i[j]].displaymovementstop()
                             a=i 
                             a[j]=[]  
@@ -1070,6 +1143,7 @@ class LabsmithBoard:
                                     self.SPS01[a[4]].UpdateStatus() 
                                     self.SPS01[a[5]].UpdateStatus() 
                                     self.SPS01[a[6]].UpdateStatus()
+                                    time.sleep(0.01)
                             if self.SPS01[a[0]].FlagIsDone == True or self.SPS01[a[1]].FlagIsDone == True or self.SPS01[a[2]].FlagIsDone == True or self.SPS01[a[3]].FlagIsDone == True or self.SPS01[a[4]].FlagIsDone == True or self.SPS01[a[5]].FlagIsDone == True or self.SPS01[a[6]].FlagIsDone == True:
                                 for k in range(a[0]):
                                     if self.SPS01[a[k]].FlagIsDone == True:
@@ -1083,6 +1157,7 @@ class LabsmithBoard:
                                             self.SPS01[b[3]].UpdateStatus() 
                                             self.SPS01[b[4]].UpdateStatus() 
                                             self.SPS01[b[5]].UpdateStatus()
+                                            time.sleep(0.01)
                                         if self.SPS01[b[0]].FlagIsDone == True or self.SPS01[b[1]].FlagIsDone == True or self.SPS01[b[2]].FlagIsDone == True or self.SPS01[b[3]].FlagIsDone == True or self.SPS01[b[4]].FlagIsDone == True or self.SPS01[b[5]].FlagIsDone == True:
                                             for p in range(b[0]):
                                                 if self.SPS01[b[p]].FlagIsDone == True:
@@ -1095,6 +1170,7 @@ class LabsmithBoard:
                                                         self.SPS01[c[2]].UpdateStatus() 
                                                         self.SPS01[c[3]].UpdateStatus() 
                                                         self.SPS01[c[4]].UpdateStatus()
+                                                        time.sleep(0.01)
                                                     if self.SPS01[c[0]].FlagIsDone == True or self.SPS01[c[1]].FlagIsDone == True or self.SPS01[c[2]].FlagIsDone == True or self.SPS01[c[3]].FlagIsDone == True or self.SPS01[c[4]].FlagIsDone == True:
                                                         for q in range(c[0]):
                                                             if self.SPS01[c[q]].FlagIsDone == True:
@@ -1106,6 +1182,7 @@ class LabsmithBoard:
                                                                     self.SPS01[d[1]].UpdateStatus() 
                                                                     self.SPS01[d[2]].UpdateStatus() 
                                                                     self.SPS01[d[3]].UpdateStatus()
+                                                                    time.sleep(0.01)
                                                                 if self.SPS01[d[0]].FlagIsDone or self.SPS01[d[1]].FlagIsDone or self.SPS01[d[2]].FlagIsDone or self.SPS01[d[3]].FlagIsDone:
                                                                     for r in range(d[0]):
                                                                         if self.SPS01[d[r]].FlagIsDone == True:
@@ -1116,6 +1193,7 @@ class LabsmithBoard:
                                                                                 self.SPS01[e[0]].UpdateStatus() 
                                                                                 self.SPS01[e[1]].UpdateStatus() 
                                                                                 self.SPS01[e[2]].UpdateStatus()
+                                                                                time.sleep(0.01)
                                                                             if self.SPS01[e[0]].FlagIsDone or self.SPS01[e[1]].FlagIsDone or self.SPS01[e[2]].FlagIsDone:
                                                                                 for s in range(e[0]):
                                                                                     if self.SPS01[e[s]].FlagIsDone == True:
@@ -1125,6 +1203,7 @@ class LabsmithBoard:
                                                                                         while self.SPS01[f[0]].FlagIsMoving and self.SPS01[f[1]].FlagIsMoving:
                                                                                             self.SPS01[f[0]].UpdateStatus() 
                                                                                             self.SPS01[f[1]].UpdateStatus()
+                                                                                            time.sleep(0.01)
                                                                                         if self.SPS01[f[0]].FlagIsDone or self.SPS01[f[1]].FlagIsDone:
                                                                                             for t in range(f[0]):
                                                                                                 if self.SPS01[f[t]].FlagIsDone:
@@ -1133,6 +1212,7 @@ class LabsmithBoard:
                                                                                                     g[t]=[] 
                                                                                                     while self.SPS01[g[0]].FlagIsMoving:
                                                                                                         self.SPS01[g[0]].UpdateStatus()
+                                                                                                        time.sleep(0.01)
                                                                                                     if self.SPS01[g[0]].FlagIsDone:
                                                                                                         self.SPS01[g[0]].displaymovementstop()
                                                                                                     break
@@ -1212,8 +1292,8 @@ class LabsmithBoard:
                         self.SPS01[i3].UpdateStatus()
                     if self.SPS01[i1].FlagIsDone == True or self.SPS01[i2].FlagIsDone == True or self.SPS01[i3].FlagIsDone == True:
                         for j in range(i[0]):
-                            if self.SPS01[i(j)].FlagIsDone == True:
-                                self.SPS01[i(j)].displaymovementstop()
+                            if self.SPS01[i[j]].FlagIsDone == True:
+                                self.SPS01[i[j]].displaymovementstop()
                                 a=i
                                 a[j]=[] ## a=[i2 i3] for j=1, a=[i1 i3] for j=2, a=[i1 i2] for j=3
                                 for count2 in range(target):
@@ -1906,9 +1986,15 @@ class LabsmithBoard:
         for i in range(len(self.C4VM)):
             self.C4VM[i].device.CmdStop()
             self.C4VM[i].UpdateStatus()
+        for i in range(len(self.C4AM)):
+            self.C4AM[i].Stop()
+        for i in range(len(self.C4PM)):
+            self.C4PM[i].Stop()
+        for i in range(len(self.CEP01)):
+            self.CEP01[i].Stop()
         self.ClockStop = datetime.now()
         comment=f"{self.ClockStop.strftime('%X')} Interface paused by the user."
-        with open("OUTPUT.txt", "a") as OUTPUT:
+        with open(output_txt_path(), "a") as OUTPUT:
             OUTPUT.write(comment + "\n")
             print(comment)
 
@@ -1933,7 +2019,7 @@ class LabsmithBoard:
                             elif self.Resume == True:
                                 self.ClockResume = datetime.now()
                                 comment=f"{self.ClockResume.strftime('%X')} Interface resumed by the user."
-                                with open("OUTPUT.txt","a") as OUTPUT:
+                                with open(output_txt_path(),"a") as OUTPUT:
                                     OUTPUT.write(comment +"\n")
                                     print(comment) 
                                 self.SPS01[i1].UpdateStatus()
@@ -1974,7 +2060,7 @@ class LabsmithBoard:
                             elif self.Resume == True:
                                 self.ClockResume = datetime.now
                                 comment=f"{self.ClockResume.strftime('%X')} Interface resumed by the user."
-                                with open("OUTPUT.txt","a") as OUTPUT:
+                                with open(output_txt_path(),"a") as OUTPUT:
                                     OUTPUT.write(comment + "\n")
                                 print(comment)
                                 self.SPS01[i1].UpdateStatus() #////////////////////////////
@@ -2010,7 +2096,7 @@ class LabsmithBoard:
                                             elif self.Resume == True:
                                                 self.ClockResume = datetime.now()
                                                 comment = f"{self.ClockResume.strftime('%X')} Interface resumed by the user."
-                                                with open("OUTPUT.txt", "a") as OUTPUT:
+                                                with open(output_txt_path(), "a") as OUTPUT:
                                                     OUTPUT.write(comment + "\n")
                                                 print(comment)
                                                 self.SPS01[a(0)].UpdateStatus() #////////////////////////////
@@ -2058,7 +2144,7 @@ class LabsmithBoard:
                             elif self.Resume == True:
                                 self.ClockResume = datetime.now()
                                 comment = f"{self.ClockResume.strftime('%X')} Interface resumed by the user."
-                                with open("OUTPUT.txt", "a") as OUTPUT:
+                                with open(output_txt_path(), "a") as OUTPUT:
                                     OUTPUT.write(comment + "\n")
                                 print(comment) 
                                 self.SPS01[i1].UpdateStatus() #////////////////////////////
@@ -2096,7 +2182,7 @@ class LabsmithBoard:
                                             elif self.Resume == True:
                                                 self.ClockResume = datetime.now()
                                                 comment = f"{self.ClockResume.strftime('%X')} Interface resumed by the user."
-                                                with open("OUTPUT.txt", "a") as OUTPUT:
+                                                with open(output_txt_path(), "a") as OUTPUT:
                                                     OUTPUT.write(comment + "\n")
                                                 print(comment)
                                                 self.SPS01[a[0]].UpdateStatus() #////////////////////////////
@@ -2132,7 +2218,7 @@ class LabsmithBoard:
                                                             elif self.Resume == True:
                                                                 self.ClockResume = datetime.now()
                                                                 comment = f"{self.ClockResume.strftime('%X')} Interface resumed by the user."
-                                                                with open("OUTPUT.txt", "a") as OUTPUT:
+                                                                with open(output_txt_path(), "a") as OUTPUT:
                                                                     OUTPUT.write(comment + "\n")
                                                                 print(comment)
                                                                 self.SPS01[b[0]].UpdateStatus() #////////////////////////////
@@ -2187,7 +2273,7 @@ class LabsmithBoard:
                             elif self.Resume == True:
                                 self.ClockResume = datetime.now()
                                 comment = f"{self.ClockResume.strftime('%X')} Interface resumed by the user."
-                                with open("OUTPUT.txt", "a") as OUTPUT:
+                                with open(output_txt_path(), "a") as OUTPUT:
                                     OUTPUT.write(comment + "\n")
                                 print(comment)
                                 self.SPS01[i1].UpdateStatus() #////////////////////////////
@@ -2229,7 +2315,7 @@ class LabsmithBoard:
                                             elif self.Resume == True:
                                                 self.ClockResume = datetime.now()
                                                 comment = f"{self.ClockResume.strftime('%X')} Interface resumed by the user."
-                                                with open("OUTPUT.txt", "a") as OUTPUT:
+                                                with open(output_txt_path(), "a") as OUTPUT:
                                                     OUTPUT.write(comment + "\n")
                                                 print(comment)
                                                 self.SPS01[a[0]].UpdateStatus() #////////////////////////////
@@ -2269,7 +2355,7 @@ class LabsmithBoard:
                                                             elif self.Resume == True:
                                                                 self.ClockResume = datetime.now()
                                                                 comment = f"{self.ClockResume.strftime('%X')} Interface resumed by the user."
-                                                                with open("OUTPUT.txt", "a") as OUTPUT:
+                                                                with open(output_txt_path(), "a") as OUTPUT:
                                                                     OUTPUT.write(comment + "\n")
                                                                 print(comment)
                                                                 self.SPS01[b[0]].UpdateStatus() #////////////////////////////
@@ -2305,7 +2391,7 @@ class LabsmithBoard:
                                                                             elif self.Resume == True:
                                                                                 self.ClockResume = datetime.now()
                                                                                 comment = f"{self.ClockResume.strftime('%X')} Interface resumed by the user."
-                                                                                with open("OUTPUT.txt", "a") as OUTPUT:
+                                                                                with open(output_txt_path(), "a") as OUTPUT:
                                                                                     OUTPUT.write(comment + "\n")
                                                                                 print(comment)
                                                                                 self.SPS01[c[0]].UpdateStatus() #////////////////////////////
@@ -2366,7 +2452,7 @@ class LabsmithBoard:
                                 elif self.Resume == True:
                                     self.ClockResume = datetime.now()
                                     comment = f"{self.ClockResume.strftime('%X')} Interface resumed by the user."
-                                    with open("OUTPUT.txt", "a") as OUTPUT:
+                                    with open(output_txt_path(), "a") as OUTPUT:
                                         OUTPUT.write(comment + "\n")
                                     print(comment)
                                     self.SPS01[i1].UpdateStatus() #////////////////////////////
@@ -2408,7 +2494,7 @@ class LabsmithBoard:
                                                 elif self.Resume == True:
                                                     self.ClockResume = datetime.now()
                                                     comment = f"{self.ClockResume.strftime('%X')} Interface resumed by the user."
-                                                    with open("OUTPUT.txt", "a") as OUTPUT:
+                                                    with open(output_txt_path(), "a") as OUTPUT:
                                                         OUTPUT.write(comment + "\n")
                                                     print(comment)
                                                     self.SPS01[a[0]].UpdateStatus() #////////////////////////////
@@ -2448,7 +2534,7 @@ class LabsmithBoard:
                                                                 elif self.Resume == True:
                                                                     self.ClockResume = datetime.now()
                                                                     comment = f"{self.ClockResume.strftime('%X')} Interface resumed by the user."
-                                                                    with open("OUTPUT.txt", "a") as OUTPUT:
+                                                                    with open(output_txt_path(), "a") as OUTPUT:
                                                                         OUTPUT.write(comment + "\n")
                                                                     print(comment)
                                                                     self.SPS01[b[0]].UpdateStatus() #////////////////////////////
@@ -2486,7 +2572,7 @@ class LabsmithBoard:
                                                                                 elif self.Resume == True:
                                                                                     self.ClockResume = datetime.now()
                                                                                     comment = f"{self.ClockResume.strftime('%X')} Interface resumed by the user."
-                                                                                    with open("OUTPUT.txt", "a") as OUTPUT:
+                                                                                    with open(output_txt_path(), "a") as OUTPUT:
                                                                                         OUTPUT.write(comment + "\n")
                                                                                     print(comment)
                                                                                     self.SPS01[c[0]].UpdateStatus() #////////////////////////////
@@ -2522,7 +2608,7 @@ class LabsmithBoard:
                                                                                                 elif self.Resume == True:
                                                                                                     self.ClockResume = datetime.now()
                                                                                                     comment = f"{self.ClockResume.strftime('%X')} Interface resumed by the user."
-                                                                                                    with open("OUTPUT.txt", "a") as OUTPUT:
+                                                                                                    with open(output_txt_path(), "a") as OUTPUT:
                                                                                                         OUTPUT.write(comment + "\n")
                                                                                                     print(comment)
                                                                                                     self.SPS01[d[0]].UpdateStatus() #////////////////////////////
@@ -2588,7 +2674,7 @@ class LabsmithBoard:
                                 elif self.Resume == True:
                                     self.ClockResume = datetime.now()
                                     comment = f"{self.ClockResume.strftime('%X')} Interface resumed by the user."
-                                    with open("OUTPUT.txt", "a") as OUTPUT:
+                                    with open(output_txt_path(), "a") as OUTPUT:
                                         OUTPUT.write(comment + "\n")
                                     print(comment)
                                     self.SPS01[i1].UpdateStatus() #////////////////////////////
@@ -2632,7 +2718,7 @@ class LabsmithBoard:
                                                 elif self.Resume == True:
                                                     self.ClockResume = datetime.now()
                                                     comment = f"{self.ClockResume.strftime('%X')} Interface resumed by the user."
-                                                    with open("OUTPUT.txt", "a") as OUTPUT:
+                                                    with open(output_txt_path(), "a") as OUTPUT:
                                                         OUTPUT.write(comment + "\n")
                                                     print(comment)
                                                     self.SPS01[a[0]].UpdateStatus() #////////////////////////////
@@ -2674,7 +2760,7 @@ class LabsmithBoard:
                                                                 elif self.Resume == True:
                                                                     self.ClockResume = datetime.now()
                                                                     comment = f"{self.ClockResume.strftime('%X')} Interface resumed by the user."
-                                                                    with open("OUTPUT.txt", "a") as OUTPUT:
+                                                                    with open(output_txt_path(), "a") as OUTPUT:
                                                                         OUTPUT.write(comment + "\n")
                                                                     print(comment)
                                                                     self.SPS01[b[0]].UpdateStatus() #////////////////////////////
@@ -2714,7 +2800,7 @@ class LabsmithBoard:
                                                                                 elif self.Resume == True:
                                                                                     self.ClockResume = datetime.now()
                                                                                     comment = f"{self.ClockResume.strftime('%X')} Interface resumed by the user."
-                                                                                    with open("OUTPUT.txt", "a") as OUTPUT:
+                                                                                    with open(output_txt_path(), "a") as OUTPUT:
                                                                                         OUTPUT.write(comment + "\n")
                                                                                     print(comment)
                                                                                     self.SPS01[c[0]].UpdateStatus() #////////////////////////////
@@ -2752,7 +2838,7 @@ class LabsmithBoard:
                                                                                                 elif self.Resume == True:
                                                                                                     self.ClockResume = datetime.now()
                                                                                                     comment = f"{self.ClockResume.strftime('%X')} Interface resumed by the user."
-                                                                                                    with open("OUTPUT.txt", "a") as OUTPUT:
+                                                                                                    with open(output_txt_path(), "a") as OUTPUT:
                                                                                                         OUTPUT.write(comment + "\n")
                                                                                                     print(comment)
                                                                                                     self.SPS01[d[0]].UpdateStatus() #////////////////////////////
@@ -2788,7 +2874,7 @@ class LabsmithBoard:
                                                                                                                 elif self.Resume == True:
                                                                                                                     self.ClockResume = datetime.now()
                                                                                                                     comment = f"{self.ClockResume.strftime('%X')} Interface resumed by the user."
-                                                                                                                    with open("OUTPUT.txt", "a") as OUTPUT:
+                                                                                                                    with open(output_txt_path(), "a") as OUTPUT:
                                                                                                                         OUTPUT.write(comment + "\n")
                                                                                                                     print(comment)
                                                                                                                     self.SPS01[e[0]].UpdateStatus() #////////////////////////////
@@ -2860,7 +2946,7 @@ class LabsmithBoard:
                                 elif self.Resume == True:
                                     self.ClockResume = datetime.now()
                                     comment = f"{self.ClockResume.strftime('%X')} Interface resumed by the user."
-                                    with open("OUTPUT.txt", "a") as OUTPUT:
+                                    with open(output_txt_path(), "a") as OUTPUT:
                                         OUTPUT.write(comment + "\n")
                                     print(comment)
                                     self.SPS01[i1].UpdateStatus() #////////////////////////////
@@ -2906,7 +2992,7 @@ class LabsmithBoard:
                                                 elif self.Resume == True:
                                                     self.ClockResume = datetime.now()
                                                     comment = f"{self.ClockResume.strftime('%X')} Interface resumed by the user."
-                                                    with open("OUTPUT.txt", "a") as OUTPUT:
+                                                    with open(output_txt_path(), "a") as OUTPUT:
                                                         OUTPUT.write(comment + "\n")
                                                     print(comment)
                                                     self.SPS01[a[0]].UpdateStatus() #////////////////////////////
@@ -2949,7 +3035,7 @@ class LabsmithBoard:
                                                                     break #count_pause1
                                                                 elif self.Resume == True:
                                                                     self.ClockResume = datetime.now()
-                                                                    with open("OUTPUT.txt", "a") as OUTPUT:
+                                                                    with open(output_txt_path(), "a") as OUTPUT:
                                                                         comment = f"{self.ClockResume.strftime('%X')} Interface resumed by the user."
                                                                         OUTPUT.write(comment + "\n")
                                                                         print(comment)
@@ -2992,7 +3078,7 @@ class LabsmithBoard:
                                                                                 elif self.Resume == True:
                                                                                     self.ClockResume = datetime.now()
                                                                                     comment = f"{self.ClockResume.strftime('%X')} Interface resumed by the user."
-                                                                                    with open("OUTPUT.txt", "a") as OUTPUT:
+                                                                                    with open(output_txt_path(), "a") as OUTPUT:
                                                                                         OUTPUT.write(comment + "\n")
                                                                                     print(comment)
                                                                                     self.SPS01[c[0]].UpdateStatus() #////////////////////////////
@@ -3032,7 +3118,7 @@ class LabsmithBoard:
                                                                                                 elif self.Resume == True:
                                                                                                     self.ClockResume = datetime.now()
                                                                                                     comment = f"{self.ClockResume.strftime('%X')} Interface resumed by the user."
-                                                                                                    with open("OUTPUT.txt", "a") as OUTPUT:
+                                                                                                    with open(output_txt_path(), "a") as OUTPUT:
                                                                                                         OUTPUT.write(comment + "\n")
                                                                                                     print(comment)
                                                                                                     self.SPS01[d[0]].UpdateStatus() #////////////////////////////
@@ -3070,7 +3156,7 @@ class LabsmithBoard:
                                                                                                                 elif self.Resume == True:
                                                                                                                     self.ClockResume = datetime.now()
                                                                                                                     comment = f"{self.ClockResume.strftime('%X')} Interface resumed by the user."
-                                                                                                                    with open("OUTPUT.txt", "a") as OUTPUT:
+                                                                                                                    with open(output_txt_path(), "a") as OUTPUT:
                                                                                                                         OUTPUT.write(comment + "\n")
                                                                                                                     print(comment)
                                                                                                                     self.SPS01[e[0]].UpdateStatus() #////////////////////////////                                                                                                                    
@@ -3107,7 +3193,7 @@ class LabsmithBoard:
                                                                                                                                 elif self.Resume == True:
                                                                                                                                     self.ClockResume = datetime.now()
                                                                                                                                     comment = f"{self.ClockResume.strftime('%X')} Interface resumed by the user."
-                                                                                                                                    with open("OUTPUT.txt", "a") as OUTPUT:
+                                                                                                                                    with open(output_txt_path(), "a") as OUTPUT:
                                                                                                                                         OUTPUT.write(comment + "\n")
                                                                                                                                     print(comment)
                                                                                                                                     self.SPS01[f[0]].UpdateStatus() #////////////////////////////
@@ -3150,7 +3236,7 @@ class LabsmithBoard:
         if self.Stop == False:
             if [d1, v1, d2, v2, d3, v3, d4, v4, d5, v5, d6, v6, d7, v7, d8, v8].count(None)%2 !=0:
                 comment='Error, missing input. Number of inputs has to be even (name of syringes and corresponding flow rates).'
-                with open("OUTPUT.txt", "a") as OUTPUT:
+                with open(output_txt_path(), "a") as OUTPUT:
                     OUTPUT.write(comment + "\n")
                     print(comment)
             else:
@@ -3159,7 +3245,7 @@ class LabsmithBoard:
                     self.addlistener('FirstDoneStopPause', "listener_firstdonepause", self.CheckFirstDoneStopPause, [i1,d1,v1]) ##it listens for the syringe FlagIsMoving == True, so it updtades continuously the state to determine the end of the command. It results in FlagReady = True again.
                     if len(self.SPS01) == 1:
                         if self.SPS01[i1].FlagIsDone == True:
-                            self.SPS01[i1].evice.CmdMoveToVolume(v1) 
+                            self.SPS01[i1].device.CmdMoveToVolume(v1) 
                             self.SPS01[i1].FlagReady = False
                             self.SPS01[i1].displaymovement()
                             if self.SPS01[i1].FlagIsMoving == True:
@@ -3307,7 +3393,7 @@ class LabsmithBoard:
     ## Display movement stopwait
     def displaymovementstopwait(self,t):
         self.ClockStop = datetime.now()
-        with open("OUTPUT.txt", "a") as OUTPUT:
+        with open(output_txt_path(), "a") as OUTPUT:
             comment = f"{self.ClockStop.strftime('%X')} Step done after waiting for {t} seconds."
             OUTPUT.write(comment + "\n")
             print(comment)
@@ -3320,6 +3406,12 @@ class LabsmithBoard:
         for i in range(len(self.C4VM)):
             self.C4VM[i].device.CmdStop()
             self.C4VM[i].UpdateStatus()
+        for i in range(len(self.C4AM)):
+            self.C4AM[i].Stop()
+        for i in range(len(self.C4PM)):
+            self.C4PM[i].Stop()
+        for i in range(len(self.CEP01)):
+            self.CEP01[i].Stop()
 
     ## Update
     def UpdateBoard(self):
@@ -3328,6 +3420,12 @@ class LabsmithBoard:
             self.SPS01[i].UpdateStatus()
         for i in range(len(self.C4VM)):
             self.C4VM[i].UpdateStatus()
+        for i in range(len(self.C4AM)):
+            self.C4AM[i].UpdateStatus()
+        for i in range(len(self.C4PM)):
+            self.C4PM[i].UpdateStatus()
+        for i in range(len(self.CEP01)):
+            self.CEP01[i].UpdateStatus()
 
     ## Wait Movement
     def MoveWait(self,time,d1 = None, v1 = None, d2 = None, v2 = None, d3 = None, v3 = None, d4 = None, v4 = None, d5 = None, v5 = None, d6 = None, v6 = None, d7 = None, v7 = None, d8 = None, v8 = None):
@@ -3337,7 +3435,7 @@ class LabsmithBoard:
         if self.Stop == False:
             if [d1, v1, d2, v2, d3, v3, d4, v4, d5, v5, d6, v6, d7, v7, d8, v8].count(None)%2 != 0:
                 comment="Error, missing input. Number of inputs has to be even (time, name of syringes and corresponding flow rates)."
-                with open("OUTPUT.txt","a") as OUTPUT:
+                with open(output_txt_path(),"a") as OUTPUT:
                     OUTPUT.write(comment +"\n")
                     print(comment) 
             else:
@@ -3433,7 +3531,7 @@ class LabsmithBoard:
                                 break
                             elif self.Resume == True:
                                 self.ClockResume = datetime.now()
-                                with open("OUTPUT.txt", "a") as OUTPUT:
+                                with open(output_txt_path(), "a") as OUTPUT:
                                     comment = f"{self.ClockResume.strftime('%X')} Interface resumed by the user."
                                     OUTPUT.write(comment + "\n")
                                     print(comment)
@@ -3492,7 +3590,7 @@ class LabsmithBoard:
                                 break
                             elif self.Resume == True:
                                 self.ClockResume = datetime.now()
-                                with open("OUTPUT.txt", "a") as OUTPUT:
+                                with open(output_txt_path(), "a") as OUTPUT:
                                     comment = f"{self.ClockResume.strftime('%X')} Interface resumed by the user."
                                     OUTPUT.write(comment + "\n")
                                     print(comment)
@@ -3590,7 +3688,7 @@ class LabsmithBoard:
                             if self.Stop == True:
                                 break
                             elif self.Resume == True:
-                                with open("OUTPUT.txt", "a") as OUTPUT:
+                                with open(output_txt_path(), "a") as OUTPUT:
                                     comment = f"{self.ClockStop.strftime('#X')}  Interface resumed by the user."
                                     OUTPUT.write(comment + "\n")
                                     print(comment)

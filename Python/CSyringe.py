@@ -2,6 +2,8 @@ import numpy as np
 from datetime import datetime
 import time
 
+from output_log import output_txt_path
+
 class CSyringe:
 
     def __init__(self, Lboard, add_syr):
@@ -19,7 +21,8 @@ class CSyringe:
         self.Flowrate = []
         self.diameter = []
         self.maxVolume = []
-        
+        self.volume_ul = None
+
         # Flags
         self.FlagIsMoving = False
         self.FlagIsDone = True
@@ -35,7 +38,7 @@ class CSyringe:
         self.ClockStopCmd = None
 
         ### Constructor
-        self.device = self. Lboard.eib.NewSPS01(np.int8(add_syr))
+        self.device = self.Lboard.eib.NewSPS01(np.int8(add_syr))
         self.name = self.device.GetName()
         self.diameter = self.device.CmdGetDiameter()
         self.maxFlowrate = self.device.GetMaxFlowrate()
@@ -45,7 +48,7 @@ class CSyringe:
 
         self.UpdateStatus()
         
-        with open("OUTPUT.txt", "a") as OUTPUT:
+        with open(output_txt_path(), "a") as OUTPUT:
             comment = f"Syringe {self.name} loaded."
             OUTPUT.write(comment + "\n")
             print(comment)
@@ -78,8 +81,15 @@ class CSyringe:
         self.FlagIsStalled = self.device.IsStalled()
         self.FlagIsMovingIn = self.device.IsMovingIn()
         self.FlagIsMovingOut = self.device.IsMovingOut()
+        try:
+            self.volume_ul = float(self.device.CmdGetVolume())
+        except Exception:
+            try:
+                self.volume_ul = float(self.device.GetLastVolume())
+            except Exception:
+                self.volume_ul = None
         if self.FlagIsStalled == True:
-            with open("OUTPUT.txt", "a") as OUTPUT:
+            with open(output_txt_path(), "a") as OUTPUT:
                 comment = f"ERROR: Syringe {self.name} is stalled."
                 OUTPUT.write(comment + "\n")
                 print(comment)
@@ -100,12 +110,12 @@ class CSyringe:
         self.ClockStartCmd = datetime.now()
         self.UpdateStatus()
         if self.FlagIsMovingIn == True:
-            with open("OUTPUT.txt", "a") as OUTPUT:
+            with open(output_txt_path(), "a") as OUTPUT:
                 comment = f"{self.ClockStartCmd.strftime('%X')} Syringe {self.name} is pulling at {self.Flowrate} ul/min."
                 OUTPUT.write(comment + "\n")
                 print(comment)
         elif self.FlagIsMovingOut == True:
-            with open("OUTPUT.txt", "a") as OUTPUT:
+            with open(output_txt_path(), "a") as OUTPUT:
                 comment = f"{self.ClockStartCmd.strftime('%X')} Syringe {self.name} is pushing at {self.Flowrate} ul/min."
                 OUTPUT.write(comment + "\n")
                 print(comment)
@@ -113,7 +123,7 @@ class CSyringe:
     ### Display stop movement on cmdwindow             
     def displaymovementstop(self):
         self.ClockStopCmd = datetime.now()
-        with open("OUTPUT.txt", "a") as OUTPUT:
+        with open(output_txt_path(), "a") as OUTPUT:
                 comment = f"{self.ClockStopCmd.strftime('%X')} Syringe {self.name} is done."
                 OUTPUT.write(comment + "\n")
                 print(comment)
@@ -124,6 +134,7 @@ class CSyringe:
         if self.FlagIsMoving == True:
             while self.FlagIsMoving == True:
                 self.UpdateStatus()
+                time.sleep(0.01)
             if self.FlagIsDone == True:
                 self.displaymovementstop()
 
@@ -137,6 +148,30 @@ class CSyringe:
         self.device.CmdStop()
         self.UpdateStatus()
         self.FlagReady = True
+
+    ### Manual microstepping (uProcess: CmdSetStepDirection + CmdMicrostep; end with Stop)
+    def BeginManualMicrostep(self, push_out: bool) -> bool:
+        """push_out=True: each microstep pushes fluid out; False: pulls in."""
+        return bool(self.device.CmdSetStepDirection(bool(push_out)))
+
+    def MicrostepOnce(self) -> bool:
+        return bool(self.device.CmdMicrostep())
+
+    def MicrostepRepeat(self, count: int, delay_sec: float = 0.002) -> int:
+        """Run CmdMicrostep count times; returns number of successful steps reported."""
+        n = max(0, int(count))
+        ok = 0
+        for _ in range(n):
+            if self.MicrostepOnce():
+                ok += 1
+            if delay_sec > 0:
+                time.sleep(delay_sec)
+        return ok
+
+    def MoveToPosition16(self, position: int) -> bool:
+        """Move to 16-bit motor position (uProcess CmdMoveToPosition), not µL volume."""
+        pos = int(position) & 0xFFFF
+        return bool(self.device.CmdMoveToPosition(pos))
 
     ### Wait
     def Wait(self,time_sec):
