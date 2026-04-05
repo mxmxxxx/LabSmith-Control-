@@ -2,6 +2,7 @@ import sys
 import os
 import time
 import math
+import itertools
 from typing import Callable, Optional
 from PyQt6 import QtWidgets, QtCore, QtGui
 try:
@@ -408,6 +409,7 @@ class GraphNodeItem(QtWidgets.QGraphicsRectItem):
     ):
         super().__init__(rect)
         self._on_moved = on_moved
+        self.setZValue(1)
         self.setFlag(QtWidgets.QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
         self.setFlag(QtWidgets.QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
         self.setFlag(QtWidgets.QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges, True)
@@ -421,8 +423,38 @@ class GraphNodeItem(QtWidgets.QGraphicsRectItem):
         return super().itemChange(change, value)
 
 
+def _graph_item_to_node_rect(item: Optional[QtWidgets.QGraphicsItem]) -> Optional[GraphNodeItem]:
+    """Walk parents until we find the flow node rectangle."""
+    while item is not None:
+        if isinstance(item, GraphNodeItem):
+            return item
+        item = item.parentItem()
+    return None
+
+
+class NodePortItem(QtWidgets.QGraphicsEllipseItem):
+    """Connection anchor on a flow node: input (left) or output (right)."""
+
+    def __init__(self, parent_node: GraphNodeItem, port_type: str):
+        super().__init__(-5, -5, 10, 10, parent_node)
+        self.port_type = port_type  # "in" | "out"
+        self.setBrush(QtGui.QBrush(QtGui.QColor("#00a8e8")))
+        self.setPen(QtGui.QPen(QtGui.QColor("white"), 1))
+        self.setZValue(25)
+        self.setAcceptHoverEvents(True)
+        self.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.CrossCursor))
+        tip = "Drag from a right port to a left port on another node to connect."
+        if port_type == "in":
+            tip = "Incoming connection (drop here)."
+        elif port_type == "out":
+            tip = "Drag to another node’s left port to connect."
+        self.setToolTip(tip)
+
+
 class FlowChartView(QtWidgets.QGraphicsView):
-    """Canvas with Ctrl+wheel zoom."""
+    """Canvas: Ctrl+wheel zoom, rubber-band select, drag from out-port to in-port."""
+
+    connectionRequested = QtCore.pyqtSignal(object, object)
 
     def __init__(self, scene: QtWidgets.QGraphicsScene):
         super().__init__(scene)
@@ -430,6 +462,108 @@ class FlowChartView(QtWidgets.QGraphicsView):
             QtWidgets.QGraphicsView.ViewportUpdateMode.SmartViewportUpdate
         )
         self.setDragMode(QtWidgets.QGraphicsView.DragMode.RubberBandDrag)
+        self.setMouseTracking(True)
+        self._connecting = False
+        self._src_rect: Optional[GraphNodeItem] = None
+        self._temp_path: Optional[QtWidgets.QGraphicsPathItem] = None
+
+    def _pick_port_at(self, scene_pos: QtCore.QPointF) -> Optional[NodePortItem]:
+        """Area pick in scene coords — more stable than single-point itemAt under zoom/overlap."""
+        sc = self.scene()
+        if sc is None:
+            return None
+        r = QtCore.QRectF(scene_pos.x() - 8, scene_pos.y() - 8, 16, 16)
+        items = sc.items(
+            r,
+            QtCore.Qt.ItemSelectionMode.IntersectsItemShape,
+            QtCore.Qt.SortOrder.DescendingOrder,
+        )
+        for it in items:
+            if isinstance(it, NodePortItem):
+                return it
+            p = it.parentItem()
+            while p is not None:
+                if isinstance(p, NodePortItem):
+                    return p
+                p = p.parentItem()
+        return None
+
+    def mousePressEvent(self, event):
+        if event.button() == QtCore.Qt.MouseButton.LeftButton:
+            sp = self.mapToScene(event.pos())
+            port = self._pick_port_at(sp)
+            if isinstance(port, NodePortItem) and port.port_type == "out":
+                parent = port.parentItem()
+                if isinstance(parent, GraphNodeItem):
+                    self._connecting = True
+                    self._src_rect = parent
+                    self._temp_path = QtWidgets.QGraphicsPathItem()
+                    pen = QtGui.QPen(QtGui.QColor("#7dd8f0"), 2, QtCore.Qt.PenStyle.DashLine)
+                    self._temp_path.setPen(pen)
+                    self._temp_path.setZValue(50)
+                    sc = self.scene()
+                    if sc is not None:
+                        sc.addItem(self._temp_path)
+                    self._update_temp_connection(sp)
+                    event.accept()
+                    return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._connecting and self._temp_path is not None:
+            sp = self.mapToScene(event.pos())
+            self._update_temp_connection(sp)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if (
+            self._connecting
+            and event.button() == QtCore.Qt.MouseButton.LeftButton
+        ):
+            sp = self.mapToScene(event.pos())
+            port = self._pick_port_at(sp)
+            dst_rect: Optional[GraphNodeItem] = None
+            if isinstance(port, NodePortItem) and port.port_type == "in":
+                p = port.parentItem()
+                if isinstance(p, GraphNodeItem):
+                    dst_rect = p
+            if (
+                self._src_rect is not None
+                and dst_rect is not None
+                and dst_rect is not self._src_rect
+            ):
+                self.connectionRequested.emit(self._src_rect, dst_rect)
+            if self._temp_path is not None:
+                sc = self.scene()
+                if sc is not None:
+                    sc.removeItem(self._temp_path)
+                self._temp_path = None
+            self._connecting = False
+            self._src_rect = None
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def _update_temp_connection(self, mouse_scene_pos: QtCore.QPointF) -> None:
+        if self._temp_path is None or self._src_rect is None:
+            return
+        out_ports = [
+            ch
+            for ch in self._src_rect.childItems()
+            if isinstance(ch, NodePortItem) and ch.port_type == "out"
+        ]
+        if not out_ports:
+            return
+        src_pos = out_ports[0].sceneBoundingRect().center()
+        dx = mouse_scene_pos.x() - src_pos.x()
+        off = max(40.0, min(abs(dx) * 0.35, 140.0))
+        c1 = QtCore.QPointF(src_pos.x() + off, src_pos.y())
+        c2 = QtCore.QPointF(mouse_scene_pos.x() - off, mouse_scene_pos.y())
+        path = QtGui.QPainterPath(src_pos)
+        path.cubicTo(c1, c2, mouse_scene_pos)
+        self._temp_path.setPath(path)
 
     def wheelEvent(self, event):
         if event.modifiers() == QtCore.Qt.KeyboardModifier.ControlModifier:
@@ -441,53 +575,87 @@ class FlowChartView(QtWidgets.QGraphicsView):
 
 
 class ArrowEdge(QtWidgets.QGraphicsPathItem):
-    """Directed edge with arrow head between two node items."""
+    """Bezier edge from source out-port to destination in-port, with arrow head and wide hit shape."""
 
-    def __init__(self, src_item: QtWidgets.QGraphicsItem, dst_item: QtWidgets.QGraphicsItem):
+    def __init__(self, src_node: dict, dst_node: dict):
         super().__init__()
-        self.src_item = src_item
-        self.dst_item = dst_item
-        pen = QtGui.QPen(QtGui.QColor("white"))
+        self._src_node = src_node
+        self._dst_node = dst_node
+        self._arrow_color = QtGui.QColor(220, 245, 255)
+        pen = QtGui.QPen(self._arrow_color)
         pen.setWidth(2)
+        pen.setCapStyle(QtCore.Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(QtCore.Qt.PenJoinStyle.RoundJoin)
         self.setPen(pen)
-        self.setZValue(-1)  # draw under nodes
+        self.setBrush(QtGui.QBrush(self._arrow_color))
+        self.setZValue(0)
         self.setFlag(QtWidgets.QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
         self.update_positions()
 
+    def cleanup(self) -> None:
+        pass
+
     def update_positions(self):
-        p1 = self.src_item.sceneBoundingRect().center()
-        p2 = self.dst_item.sceneBoundingRect().center()
+        op = self._src_node.get("out_port")
+        ip = self._dst_node.get("in_port")
+        if op is None or ip is None:
+            self.prepareGeometryChange()
+            self.setPath(QtGui.QPainterPath())
+            return
+        p1 = op.sceneBoundingRect().center()
+        p2 = ip.sceneBoundingRect().center()
+        dx = p2.x() - p1.x()
+        dy = p2.y() - p1.y()
+        dist = math.hypot(dx, dy)
+        if dist < 1e-6:
+            self.prepareGeometryChange()
+            self.setPath(QtGui.QPainterPath())
+            return
 
-        path = QtGui.QPainterPath(p1)
-        path.lineTo(p2)
-        self.setPath(path)
+        off = max(40.0, min(abs(dx) * 0.35, 140.0))
+        c1 = QtCore.QPointF(p1.x() + off, p1.y())
+        c2 = QtCore.QPointF(p2.x() - off, p2.y())
 
-        # Arrow head at p2
-        line_vec = QtCore.QLineF(p1, p2)
-        angle = line_vec.angle()  # degrees
-        arrow_size = 10.0
+        curve = QtGui.QPainterPath(p1)
+        curve.cubicTo(c1, c2, p2)
 
-        # Two points for arrowhead
-        angle1 = math.radians(angle + 150)
-        angle2 = math.radians(angle - 150)
-        p3 = QtCore.QPointF(
-            p2.x() + arrow_size * math.cos(angle1),
-            p2.y() - arrow_size * math.sin(angle1),
-        )
-        p4 = QtCore.QPointF(
-            p2.x() + arrow_size * math.cos(angle2),
-            p2.y() - arrow_size * math.sin(angle2),
-        )
+        # Tangent at end: proportional to p2 - c2 (Bezier derivative at t=1)
+        tx = p2.x() - c2.x()
+        ty = p2.y() - c2.y()
+        tlen = math.hypot(tx, ty)
+        if tlen < 1e-6:
+            tx, ty = dx / dist, dy / dist
+            tlen = 1.0
+        ux, uy = tx / tlen, ty / tlen
+        px, py = -uy, ux
 
-        arrow_path = QtGui.QPainterPath(p2)
-        arrow_path.lineTo(p3)
-        arrow_path.moveTo(p2)
-        arrow_path.lineTo(p4)
+        arrow_len = float(min(24.0, max(14.0, dist * 0.14), dist * 0.4))
+        wing = arrow_len * 0.65
+
+        tip = QtCore.QPointF(p2.x(), p2.y())
+        base = QtCore.QPointF(tip.x() - ux * arrow_len, tip.y() - uy * arrow_len)
+        left = QtCore.QPointF(base.x() + px * wing, base.y() + py * wing)
+        right = QtCore.QPointF(base.x() - px * wing, base.y() - py * wing)
+
+        head = QtGui.QPainterPath()
+        head.moveTo(tip)
+        head.lineTo(left)
+        head.lineTo(right)
+        head.closeSubpath()
 
         full_path = QtGui.QPainterPath()
-        full_path.addPath(path)
-        full_path.addPath(arrow_path)
+        full_path.addPath(curve)
+        full_path.addPath(head)
+
+        self.prepareGeometryChange()
         self.setPath(full_path)
+
+    def shape(self) -> QtGui.QPainterPath:
+        stroker = QtGui.QPainterPathStroker()
+        stroker.setWidth(14)
+        stroker.setCapStyle(QtCore.Qt.PenCapStyle.RoundCap)
+        stroker.setJoinStyle(QtCore.Qt.PenJoinStyle.RoundJoin)
+        return stroker.createStroke(self.path())
 
     def refresh_geometry(self):
         """Update path when endpoints move (no scene item churn)."""
@@ -772,25 +940,36 @@ class MainWindow(QtWidgets.QMainWindow):
         self.v2_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self.v3_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self.v4_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        # One slider per row — four in a single grid row were ~80px wide each and often
+        # unusable in the narrow left column (hard to drag / no hit target).
         for idx, sl in enumerate(
             [self.v1_slider, self.v2_slider, self.v3_slider, self.v4_slider], start=1
         ):
             sl.setRange(0, 1)
-            sl.setMaximumHeight(28)
-            sl.setToolTip(
-                f"V{idx} quick: 0/1 passed to CmdSetValves. "
-                f"Native uProcess: 0=no change, 1=A, 2=closed, 3=B — use “4VM native” below."
+            sl.setSingleStep(1)
+            sl.setPageStep(1)
+            sl.setTracking(True)
+            sl.setMaximumHeight(32)
+            sl.setMinimumWidth(200)
+            sl.setSizePolicy(
+                QtWidgets.QSizePolicy.Policy.Expanding,
+                QtWidgets.QSizePolicy.Policy.Fixed,
             )
-            m_layout.addWidget(QtWidgets.QLabel(f"V{idx}:"), 2, (idx - 1) * 2)
-            m_layout.addWidget(sl, 2, (idx - 1) * 2 + 1)
+            sl.setToolTip(
+                f"V{idx} quick: 0/1 passed to CmdSetValves (0=no change, 1=position A). "
+                f"For codes 2=closed, 3=B use “4VM native” below."
+            )
+            row = 1 + idx
+            m_layout.addWidget(QtWidgets.QLabel(f"V{idx}:"), row, 0)
+            m_layout.addWidget(sl, row, 1, 1, 3)
 
         self.switch_btn = QtWidgets.QPushButton("Switch valves")
-        m_layout.addWidget(self.switch_btn, 3, 0, 1, 4)
+        m_layout.addWidget(self.switch_btn, 6, 0, 1, 4)
 
         self.manifold_status_label = QtWidgets.QLabel("—")
         self.manifold_status_label.setWordWrap(True)
         self.manifold_status_label.setStyleSheet("color: #c8c8d8; font-size: 9pt;")
-        m_layout.addWidget(self.manifold_status_label, 4, 0, 1, 4)
+        m_layout.addWidget(self.manifold_status_label, 7, 0, 1, 4)
 
         self.manifold_adv_group = QtWidgets.QGroupBox(
             "4VM native — CmdSetValves / CmdSetValveMotion"
@@ -889,14 +1068,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.flow_steps = []  # list of dicts
 
         # ===== Flow graph tab =====
+        self.graph_nodes = []  # list of dicts with "type", params, "item", ports, incoming/outgoing, label_item
+        self.graph_edges = []  # list of {"id", "src", "dst", "item": ArrowEdge}
+        self._graph_edge_counter = itertools.count(1)
         self._init_flow_graph()
-        self.graph_nodes = []  # list of dicts with "type", params, "item"
-        self.graph_edges = []  # list of ArrowEdge
-
-        # Debounced edge refresh when nodes move (no full scene rebuild per pixel)
-        self._graph_edge_timer = QtCore.QTimer(self)
-        self._graph_edge_timer.setSingleShot(True)
-        self._graph_edge_timer.timeout.connect(self._refresh_graph_edge_positions_only)
+        self._graph_refresh_nodes_bar()
 
         # Initial serial scan
         self._refresh_serial_ports()
@@ -1124,22 +1300,127 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     def _schedule_graph_edge_positions(self):
-        self._graph_edge_timer.start(45)
+        """Keep arrows glued to nodes while dragging."""
+        for rec in self.graph_edges:
+            rec["item"].refresh_geometry()
 
-    def _refresh_graph_edge_positions_only(self):
-        for e in self.graph_edges:
-            e.refresh_geometry()
+    def _graph_node_dict_from_rect(self, rect_item: GraphNodeItem) -> Optional[dict]:
+        for n in self.graph_nodes:
+            if n.get("item") is rect_item:
+                return n
+        return None
 
-    def _rebuild_graph_edges(self):
-        for edge in self.graph_edges:
-            self.graph_scene.removeItem(edge)
-        self.graph_edges.clear()
-        for i in range(len(self.graph_nodes) - 1):
-            item1 = self.graph_nodes[i]["item"]
-            item2 = self.graph_nodes[i + 1]["item"]
-            edge = ArrowEdge(item1, item2)
-            self.graph_scene.addItem(edge)
-            self.graph_edges.append(edge)
+    def _graph_remove_edge_record(self, rec: dict) -> None:
+        """Remove one edge from scene, graph_edges, and node incoming/outgoing lists."""
+        if rec not in self.graph_edges:
+            return
+        s, d = rec["src"], rec["dst"]
+        if rec in s.get("outgoing", []):
+            s["outgoing"].remove(rec)
+        if rec in d.get("incoming", []):
+            d["incoming"].remove(rec)
+        rec["item"].cleanup()
+        self.graph_scene.removeItem(rec["item"])
+        self.graph_edges.remove(rec)
+
+    def _graph_create_edge(self, src_node: dict, dst_node: dict) -> None:
+        """Single-chain mode: at most one out per node, one in per node; new wire replaces old."""
+        if src_node is dst_node:
+            return
+        for r in list(src_node.get("outgoing", [])):
+            self._graph_remove_edge_record(r)
+        for r in list(dst_node.get("incoming", [])):
+            self._graph_remove_edge_record(r)
+        edge = ArrowEdge(src_node, dst_node)
+        self.graph_scene.addItem(edge)
+        rec = {
+            "id": next(self._graph_edge_counter),
+            "src": src_node,
+            "dst": dst_node,
+            "item": edge,
+        }
+        src_node.setdefault("outgoing", []).append(rec)
+        dst_node.setdefault("incoming", []).append(rec)
+        self.graph_edges.append(rec)
+
+    def _on_graph_connection_requested(self, src_rect: GraphNodeItem, dst_rect: GraphNodeItem):
+        src_n = self._graph_node_dict_from_rect(src_rect)
+        dst_n = self._graph_node_dict_from_rect(dst_rect)
+        if src_n is None or dst_n is None:
+            return
+        self._graph_create_edge(src_n, dst_n)
+
+    def _validate_graph_for_run(self) -> None:
+        """Raise ValueError with a readable message if the graph cannot run as a single chain."""
+        nodes = self.graph_nodes
+        if not nodes:
+            raise ValueError("No nodes to run.")
+        for n in nodes:
+            ni = len(n.get("incoming", []))
+            no = len(n.get("outgoing", []))
+            if ni > 1:
+                raise ValueError(
+                    "A node has more than one incoming connection. "
+                    "Single-chain mode allows at most one wire into each node — delete extras."
+                )
+            if no > 1:
+                raise ValueError(
+                    "A node has more than one outgoing connection. "
+                    "Single-chain mode allows at most one wire from each node."
+                )
+        n = len(nodes)
+        m = len(self.graph_edges)
+        if n == 1:
+            return
+        if m == 0:
+            raise ValueError(
+                "You have multiple nodes but no connections. "
+                "Drag from a right (out) port to a left (in) port to form one chain."
+            )
+        starts = [x for x in nodes if len(x.get("incoming", [])) == 0]
+        if len(starts) != 1:
+            raise ValueError(
+                f"Need exactly one start node (no incoming wire); found {len(starts)}."
+            )
+        ends = [x for x in nodes if len(x.get("outgoing", [])) == 0]
+        if len(ends) != 1:
+            raise ValueError(
+                f"Need exactly one end node (no outgoing wire); found {len(ends)}."
+            )
+        if m != n - 1:
+            raise ValueError(
+                f"For {n} nodes in one chain, expect {n - 1} connection(s); found {m}."
+            )
+
+    def _get_graph_execution_order(self) -> list:
+        """Topological order along explicit edges (single chain after validation)."""
+        nodes = self.graph_nodes
+        if not nodes:
+            return []
+        node_set = set(nodes)
+        indeg = {id(n): 0 for n in nodes}
+        outgoing = {id(n): [] for n in nodes}
+        for rec in self.graph_edges:
+            s, d = rec["src"], rec["dst"]
+            if s not in node_set or d not in node_set:
+                continue
+            outgoing[id(s)].append(d)
+            indeg[id(d)] += 1
+        queue = [n for n in nodes if indeg[id(n)] == 0]
+        order = []
+        while queue:
+            n = queue.pop(0)
+            order.append(n)
+            for nxt in outgoing[id(n)]:
+                indeg[id(nxt)] -= 1
+                if indeg[id(nxt)] == 0:
+                    queue.append(nxt)
+        if len(order) != len(nodes):
+            raise ValueError(
+                "The graph has a cycle or a disconnected island. "
+                "Use a single chain: one start → … → one end, with no loops."
+            )
+        return order
 
     def _graph_fit_view(self):
         self.graph_view.resetTransform()
@@ -1685,8 +1966,9 @@ class MainWindow(QtWidgets.QMainWindow):
         layout = QtWidgets.QHBoxLayout(container)
         container.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.MinimumExpanding,
-            QtWidgets.QSizePolicy.Policy.Minimum,
+            QtWidgets.QSizePolicy.Policy.MinimumExpanding,
         )
+        container.setMinimumHeight(360)
         flow_scroll = QtWidgets.QScrollArea()
         flow_scroll.setWidgetResizable(True)
         flow_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
@@ -1706,6 +1988,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.flow_components_list.addItems(
             ["Move syringe", "Wait", "Switch valves", "Stop board"]
         )
+        if self.flow_components_list.count() > 0:
+            self.flow_components_list.setCurrentRow(0)
         left_layout.addWidget(self.flow_components_list)
         self.add_step_btn = QtWidgets.QPushButton("Add selected")
         left_layout.addWidget(self.add_step_btn)
@@ -1752,12 +2036,29 @@ class MainWindow(QtWidgets.QMainWindow):
         self.flow_table.selectionModel().selectionChanged.connect(self._on_flow_selection_changed)
         self.flow_table.cellDoubleClicked.connect(self._on_flow_table_double_clicked)
 
+    def _flow_selected_component_text(self) -> Optional[str]:
+        lst = self.flow_components_list
+        for it in lst.selectedItems():
+            return it.text()
+        r = lst.currentRow()
+        if r < 0 and lst.count() > 0:
+            lst.setCurrentRow(0)
+            r = 0
+        if 0 <= r < lst.count():
+            item = lst.item(r)
+            return item.text() if item is not None else None
+        return None
+
     def _on_add_step(self):
         row = self.flow_table.rowCount()
-        selected_items = self.flow_components_list.selectedItems()
-        if not selected_items:
+        step_type = self._flow_selected_component_text()
+        if not step_type:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Add step",
+                "请在左侧列表中选择一种步骤类型（或点击列表第一项后再试）。",
+            )
             return
-        step_type = selected_items[0].text()
 
         # Default step dict
         if step_type == "Move syringe":
@@ -1794,6 +2095,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_remove_step(self):
         row = self.flow_table.currentRow()
         if row < 0 or row >= len(self.flow_steps):
+            QtWidgets.QMessageBox.information(
+                self, "Remove step", "请先在表格中选中要删除的一行。"
+            )
             return
         self.flow_table.removeRow(row)
         del self.flow_steps[row]
@@ -1963,6 +2267,39 @@ class MainWindow(QtWidgets.QMainWindow):
             step[field] = value
         self._refresh_flow_row(row)
 
+    def _execute_one_flow_step(self, step: dict) -> None:
+        """Run one step dict on the connected board; raises on invalid config or hardware error."""
+        if self._board is None:
+            raise RuntimeError("Board not connected.")
+        t = step.get("type")
+        if t == "Move syringe":
+            name = step.get("syringe", "")
+            flow = float(step.get("flowrate", 0.0))
+            vol = float(step.get("volume", 0.0))
+            if not name:
+                raise ValueError("Syringe name is empty.")
+            self._board.Move(name, flow, vol)
+        elif t == "Wait":
+            sec = float(step.get("seconds", 0.0))
+            if sec > 0:
+                interruptible_sleep(sec)
+        elif t == "Switch valves":
+            name = step.get("manifold", "")
+            if not name:
+                raise ValueError("Manifold name is empty.")
+            idx_m = self._board.FindIndexM(name)
+            dev = self._board.C4VM[idx_m]
+            dev.SwitchValves(
+                int(step.get("v1", 0)),
+                int(step.get("v2", 0)),
+                int(step.get("v3", 0)),
+                int(step.get("v4", 0)),
+            )
+        elif t == "Stop board":
+            self._board.StopBoard()
+        else:
+            raise ValueError(f"Unknown step type: {t!r}")
+
     def _on_run_flow(self):
         if self._board is None:
             QtWidgets.QMessageBox.warning(self, "Not connected", "Please connect the board first.")
@@ -1979,31 +2316,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._set_busy_message(f"Flow {idx}/{n}: {t}…")
                 QtWidgets.QApplication.processEvents()
                 try:
-                    if t == "Move syringe":
-                        name = step.get("syringe", "")
-                        flow = float(step.get("flowrate", 0.0))
-                        vol = float(step.get("volume", 0.0))
-                        if not name:
-                            raise ValueError("Syringe name is empty.")
-                        self._board.Move(name, flow, vol)
-                    elif t == "Wait":
-                        sec = float(step.get("seconds", 0.0))
-                        if sec > 0:
-                            interruptible_sleep(sec)
-                    elif t == "Switch valves":
-                        name = step.get("manifold", "")
-                        if not name:
-                            raise ValueError("Manifold name is empty.")
-                        idx_m = self._board.FindIndexM(name)
-                        dev = self._board.C4VM[idx_m]
-                        dev.SwitchValves(
-                            int(step.get("v1", 0)),
-                            int(step.get("v2", 0)),
-                            int(step.get("v3", 0)),
-                            int(step.get("v4", 0)),
-                        )
-                    elif t == "Stop board":
-                        self._board.StopBoard()
+                    self._execute_one_flow_step(step)
                 except Exception as e:
                     QtWidgets.QMessageBox.critical(
                         self,
@@ -2016,7 +2329,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ===== Flow graph (visual flowchart) =====
     def _init_flow_graph(self):
-        """Simple visual flowchart: nodes with automatic sequential connections."""
+        """Visual flowchart: explicit edges (drag right port → left port)."""
         container = QtWidgets.QWidget()
         layout = QtWidgets.QHBoxLayout(container)
         self.graph_layout.addWidget(container)
@@ -2028,7 +2341,30 @@ class MainWindow(QtWidgets.QMainWindow):
         self.graph_components_list.addItems(
             ["Move syringe", "Wait", "Switch valves", "Stop board"]
         )
+        if self.graph_components_list.count() > 0:
+            self.graph_components_list.setCurrentRow(0)
         left_layout.addWidget(self.graph_components_list)
+        self.graph_components_list.setToolTip(
+            "Left-click a module type to add a node to the canvas (same as Add node)."
+        )
+
+        bar_box = QtWidgets.QGroupBox("Nodes on canvas")
+        bar_layout_outer = QtWidgets.QVBoxLayout(bar_box)
+        self.graph_nodes_bar_inner = QtWidgets.QWidget()
+        self.graph_nodes_bar_layout = QtWidgets.QVBoxLayout(self.graph_nodes_bar_inner)
+        self.graph_nodes_bar_layout.setContentsMargins(4, 4, 4, 4)
+        self.graph_nodes_bar_layout.setSpacing(4)
+        bar_scroll = QtWidgets.QScrollArea()
+        bar_scroll.setWidgetResizable(True)
+        bar_scroll.setWidget(self.graph_nodes_bar_inner)
+        bar_scroll.setMaximumHeight(140)
+        bar_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        bar_scroll.setHorizontalScrollBarPolicy(
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        bar_layout_outer.addWidget(bar_scroll)
+        left_layout.addWidget(bar_box)
+
         self.graph_add_btn = QtWidgets.QPushButton("Add node")
         self.graph_edit_btn = QtWidgets.QPushButton("Edit selected node")
         self.graph_delete_edge_btn = QtWidgets.QPushButton("Delete selected connection")
@@ -2044,7 +2380,10 @@ class MainWindow(QtWidgets.QMainWindow):
         center_layout = QtWidgets.QVBoxLayout(center_box)
         self.graph_scene = QtWidgets.QGraphicsScene()
         self.graph_view = FlowChartView(self.graph_scene)
-        tip = QtWidgets.QLabel("Tip: Ctrl + mouse wheel to zoom. Drag canvas background to box-select.")
+        tip = QtWidgets.QLabel(
+            "Tip: Ctrl+wheel zoom. Drag out→in to wire. Single-chain only: one in / one out per node, "
+            "one start and one end; new wire replaces an old one on those ports. Run validates then executes."
+        )
         tip.setStyleSheet("color: palette(mid); font-size: 11px;")
         center_layout.addWidget(tip)
         center_layout.addWidget(self.graph_view)
@@ -2065,32 +2404,58 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Signals
         self.graph_add_btn.clicked.connect(self._on_graph_add_node)
+        self.graph_components_list.itemClicked.connect(self._on_graph_component_item_clicked)
         self.graph_edit_btn.clicked.connect(self._on_graph_edit_node)
         self.graph_delete_edge_btn.clicked.connect(self._on_graph_delete_edge)
         self.graph_clear_btn.clicked.connect(self._on_graph_clear)
         self.graph_run_btn.clicked.connect(self._on_graph_run)
         self.graph_fit_btn.clicked.connect(self._graph_fit_view)
+        self.graph_view.connectionRequested.connect(self._on_graph_connection_requested)
 
-    def _on_graph_add_node(self):
-        selected = self.graph_components_list.selectedItems()
-        if not selected:
-            return
-        step_type = selected[0].text()
-        # Reuse default step structures from flow designer
+    def _graph_selected_component_text(self) -> Optional[str]:
+        lst = self.graph_components_list
+        for it in lst.selectedItems():
+            return it.text()
+        r = lst.currentRow()
+        if r < 0 and lst.count() > 0:
+            lst.setCurrentRow(0)
+            r = 0
+        if 0 <= r < lst.count():
+            item = lst.item(r)
+            return item.text() if item is not None else None
+        return None
+
+    def _graph_step_for_graphics_item(self, item):
+        """Map click on node rect or its child label to the step dict."""
+        while item is not None:
+            for n in self.graph_nodes:
+                if n.get("item") is item:
+                    return n
+            item = item.parentItem()
+        return None
+
+    def _on_graph_component_item_clicked(self, item: QtWidgets.QListWidgetItem):
+        """Left-click a module type in the list → add that node to the canvas."""
+        t = item.text().strip() if item is not None else ""
+        if t:
+            self._graph_add_node_from_type(t)
+
+    def _graph_step_dict_for_type(self, step_type: str) -> dict:
+        """Default step payload for a graph node type (same as flow designer)."""
         if step_type == "Move syringe":
-            step = {
+            return {
                 "type": "Move syringe",
                 "syringe": "",
                 "flowrate": 100.0,
                 "volume": 10.0,
             }
-        elif step_type == "Wait":
-            step = {
+        if step_type == "Wait":
+            return {
                 "type": "Wait",
                 "seconds": 1.0,
             }
-        elif step_type == "Switch valves":
-            step = {
+        if step_type == "Switch valves":
+            return {
                 "type": "Switch valves",
                 "manifold": "",
                 "v1": 0,
@@ -2098,10 +2463,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 "v3": 0,
                 "v4": 0,
             }
-        else:
-            step = {"type": "Stop board"}
+        return {"type": "Stop board"}
 
-        # Create graphics node
+    def _graph_add_node_from_type(self, step_type: str) -> None:
+        if not step_type:
+            return
+        step = self._graph_step_dict_for_type(step_type)
+
         index = len(self.graph_nodes)
         node_width, node_height = 150, 50
         x = 0
@@ -2118,62 +2486,145 @@ class MainWindow(QtWidgets.QMainWindow):
         label = self.graph_scene.addSimpleText(step_type)
         label.setBrush(QtGui.QBrush(QtGui.QColor("white")))
         label.setParentItem(rect_item)
+        label.setAcceptedMouseButtons(QtCore.Qt.MouseButton.NoButton)
         label_rect = label.boundingRect()
         label.setPos(
             (node_width - label_rect.width()) / 2,
             (node_height - label_rect.height()) / 2,
         )
 
+        cy = node_height / 2
+        step["in_port"] = NodePortItem(rect_item, "in")
+        step["in_port"].setPos(0, cy)
+        step["out_port"] = NodePortItem(rect_item, "out")
+        step["out_port"].setPos(node_width, cy)
+        step["incoming"] = []
+        step["outgoing"] = []
+        step["label_item"] = label
+
         step["item"] = rect_item
         self.graph_nodes.append(step)
-        self._rebuild_graph_edges()
+        self._graph_refresh_nodes_bar()
+
+    def _graph_refresh_nodes_bar(self) -> None:
+        """Rebuild the left-panel list of canvas nodes with Delete buttons."""
+        lay = self.graph_nodes_bar_layout
+        while lay.count():
+            item = lay.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+
+        if not self.graph_nodes:
+            hint = QtWidgets.QLabel("No nodes yet — click a module above.")
+            hint.setStyleSheet("color: #888898; font-size: 10pt;")
+            hint.setWordWrap(True)
+            lay.addWidget(hint)
+            return
+
+        for i, n in enumerate(self.graph_nodes):
+            row = QtWidgets.QWidget()
+            h = QtWidgets.QHBoxLayout(row)
+            h.setContentsMargins(0, 0, 0, 0)
+            title = n.get("type", "?")
+            lbl = QtWidgets.QLabel(f"{i + 1}. {title}")
+            lbl.setStyleSheet("color: #d0d0dc;")
+            del_btn = QtWidgets.QPushButton("Delete")
+            del_btn.setFixedWidth(72)
+            del_btn.setToolTip("Remove this node from the canvas (and its wires).")
+            del_btn.clicked.connect(
+                lambda _checked=False, node=n: self._graph_delete_node(node)
+            )
+            h.addWidget(lbl, 1)
+            h.addWidget(del_btn)
+            lay.addWidget(row)
+
+    def _graph_delete_node(self, node: dict) -> None:
+        """Remove a node and any edges touching it."""
+        if node not in self.graph_nodes:
+            return
+        seen: set[int] = set()
+        for r in list(node.get("incoming", [])) + list(node.get("outgoing", [])):
+            rid = id(r)
+            if rid in seen:
+                continue
+            seen.add(rid)
+            self._graph_remove_edge_record(r)
+        self.graph_scene.removeItem(node["item"])
+        self.graph_nodes.remove(node)
+        self._graph_refresh_nodes_bar()
+
+    def _on_graph_add_node(self):
+        step_type = self._graph_selected_component_text()
+        if not step_type:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Add node",
+                "请在左侧列表中选择一种节点类型（或点击列表第一项后再试）。",
+            )
+            return
+        self._graph_add_node_from_type(step_type)
 
     def _on_graph_delete_edge(self):
         """Delete currently selected connection line."""
         selected_items = self.graph_scene.selectedItems()
         if not selected_items:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Delete connection",
+                "请在画布上点击选中一条连接线（箭头），再按此按钮删除。",
+            )
             return
         for item in selected_items:
             if isinstance(item, ArrowEdge):
-                if item in self.graph_edges:
-                    self.graph_edges.remove(item)
-                self.graph_scene.removeItem(item)
+                for rec in list(self.graph_edges):
+                    if rec["item"] is item:
+                        self._graph_remove_edge_record(rec)
+                        break
 
     def _on_graph_edit_node(self):
         selected_items = self.graph_scene.selectedItems()
         if not selected_items:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Edit node",
+                "请先在画布上点击选中一个流程节点（方框），再编辑参数。",
+            )
             return
         item = selected_items[0]
-        node = None
-        for n in self.graph_nodes:
-            if n.get("item") is item:
-                node = n
-                break
+        node = self._graph_step_for_graphics_item(item)
         if node is None:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Edit node",
+                "当前选中项不是流程节点。请点击节点方框（或空白处取消选中后重试）。",
+            )
             return
 
         dlg = StepParamDialog(self, self._board, node)
         if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
-            # Optionally update label with more info
             item: QtWidgets.QGraphicsRectItem = node["item"]
-            # Remove old child texts
-            for child in item.childItems():
-                self.graph_scene.removeItem(child)
+            old_lbl = node.get("label_item")
+            if old_lbl is not None:
+                self.graph_scene.removeItem(old_lbl)
             text = self._describe_step(node)
             label = self.graph_scene.addSimpleText(text if text else node["type"])
             label.setBrush(QtGui.QBrush(QtGui.QColor("white")))
             label.setParentItem(item)
+            label.setAcceptedMouseButtons(QtCore.Qt.MouseButton.NoButton)
             label_rect = label.boundingRect()
             rect = item.rect()
             label.setPos(
                 (rect.width() - label_rect.width()) / 2,
                 (rect.height() - label_rect.height()) / 2,
             )
+            node["label_item"] = label
 
     def _on_graph_clear(self):
+        self.graph_edges.clear()
         self.graph_scene.clear()
         self.graph_nodes.clear()
-        self.graph_edges.clear()
+        self._graph_refresh_nodes_bar()
 
     def _on_graph_run(self):
         if self._board is None:
@@ -2186,40 +2637,22 @@ class MainWindow(QtWidgets.QMainWindow):
                 self, "No nodes", "Please add at least one node."
             )
             return
+        try:
+            self._validate_graph_for_run()
+            exec_order = self._get_graph_execution_order()
+        except ValueError as e:
+            QtWidgets.QMessageBox.warning(self, "Graph error", str(e))
+            return
 
-        n = len(self.graph_nodes)
+        n = len(exec_order)
         self._begin_busy("Running graph…")
         try:
-            for idx, step in enumerate(self.graph_nodes, start=1):
+            for idx, step in enumerate(exec_order, start=1):
                 t = step.get("type")
                 self._set_busy_message(f"Graph {idx}/{n}: {t}…")
                 QtWidgets.QApplication.processEvents()
                 try:
-                    if t == "Move syringe":
-                        name = step.get("syringe", "")
-                        flow = float(step.get("flowrate", 0.0))
-                        vol = float(step.get("volume", 0.0))
-                        if not name:
-                            raise ValueError("Syringe name is empty.")
-                        self._board.Move(name, flow, vol)
-                    elif t == "Wait":
-                        sec = float(step.get("seconds", 0.0))
-                        if sec > 0:
-                            interruptible_sleep(sec)
-                    elif t == "Switch valves":
-                        name = step.get("manifold", "")
-                        if not name:
-                            raise ValueError("Manifold name is empty.")
-                        idx_m = self._board.FindIndexM(name)
-                        dev = self._board.C4VM[idx_m]
-                        dev.SwitchValves(
-                            int(step.get("v1", 0)),
-                            int(step.get("v2", 0)),
-                            int(step.get("v3", 0)),
-                            int(step.get("v4", 0)),
-                        )
-                    elif t == "Stop board":
-                        self._board.StopBoard()
+                    self._execute_one_flow_step(step)
                 except Exception as e:
                     QtWidgets.QMessageBox.critical(
                         self,
