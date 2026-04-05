@@ -11,7 +11,7 @@ except Exception:
     list_ports = None
 
 from LabsmithBoard import LabsmithBoard
-from output_log import log_directory, output_txt_path
+from output_log import app_writable_root, log_directory, output_txt_path
 
 
 def parse_com_port_to_int(text_or_device: Optional[str]) -> Optional[int]:
@@ -1010,16 +1010,18 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Log area
         log_header = QtWidgets.QHBoxLayout()
-        log_header.addWidget(
-            QtWidgets.QLabel(f"Output log ({os.path.join('logs', 'OUTPUT.txt')}):")
-        )
+        self.log_path_label = QtWidgets.QLabel()
+        self.log_path_label.setWordWrap(True)
+        self.log_path_label.setStyleSheet("color: #a0a0b0; font-size: 9pt;")
+        self._update_log_path_label()
+        log_header.addWidget(self.log_path_label, 1)
         log_header.addStretch()
         self.open_logs_btn = QtWidgets.QPushButton("Open logs folder")
-        self.open_logs_btn.setToolTip("Reveal Python/logs in your file manager.")
+        self.open_logs_btn.setToolTip("Open the folder that contains OUTPUT.txt (see path on the left).")
         log_header.addWidget(self.open_logs_btn)
         self.clear_log_btn = QtWidgets.QPushButton("Clear log")
         self.clear_log_btn.setToolTip(
-            "Clear on-screen log only (does not delete the file under Python/logs/)."
+            "Clear on-screen log only (does not delete OUTPUT.txt on disk)."
         )
         log_header.addWidget(self.clear_log_btn)
         right_layout.addLayout(log_header)
@@ -1068,7 +1070,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.flow_steps = []  # list of dicts
 
         # ===== Flow graph tab =====
+        # graph_nodes: canvas model (nodes + wiring). Independent from flow_steps unless you add sync (see
+        # _init_flow_graph docstring). Step dicts share the same keys as Flow Designer rows for execution.
         self.graph_nodes = []  # list of dicts with "type", params, "item", ports, incoming/outgoing, label_item
+        self._graph_sidebar_step = None  # step dict currently shown in the graph param sidebar
         self.graph_edges = []  # list of {"id", "src", "dst", "item": ArrowEdge}
         self._graph_edge_counter = itertools.count(1)
         self._init_flow_graph()
@@ -1116,6 +1121,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self._settings.setValue("last_com_text", self.port_combo.currentText().strip())
         super().closeEvent(event)
 
+    def _update_log_path_label(self):
+        p = output_txt_path()
+        self.log_path_label.setText(f"Output log: {p}")
+        self.log_path_label.setToolTip(
+            f"Writable root: {app_writable_root()}\n"
+            f"Set LABSMITH_DATA_DIR to redirect logs (e.g. %APPDATA%\\LabSmithControl)."
+        )
+
     def _open_logs_folder(self):
         path = log_directory()
         url = QtCore.QUrl.fromLocalFile(path)
@@ -1125,12 +1138,13 @@ class MainWindow(QtWidgets.QMainWindow):
             )
 
     def _show_about(self):
+        log_hint = output_txt_path()
         QtWidgets.QMessageBox.about(
             self,
             "About LabSmith Control",
             "LabSmith Control\n\n"
             "PyQt6 desktop UI for LabSmith uProcess hardware.\n"
-            "Session logs: Python/logs/OUTPUT.txt\n\n"
+            f"Session log file:\n{log_hint}\n\n"
             "Shortcuts:\n"
             "  Ctrl+L          Clear log view\n"
             "  F5              Refresh serial ports\n"
@@ -1502,6 +1516,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.syringe_status_label.setText("—")
             self.manifold_status_label.setText("—")
             self.bus_text.clear()
+            self._graph_refresh_param_sidebar_from_board()
             self._sync_connection_ui()
             self._update_status_bar()
 
@@ -1647,6 +1662,7 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
         self._on_syringe_selection_changed()
         self._on_manifold_selection_changed()
+        self._graph_refresh_param_sidebar_from_board()
 
     def _syringe_logical_name(self) -> str:
         data = self.syringe_combo.currentData()
@@ -2016,8 +2032,13 @@ class MainWindow(QtWidgets.QMainWindow):
         btn_layout.addWidget(self.run_flow_btn)
         center_layout.addLayout(btn_layout)
 
-        # Right: parameter editor
+        # Right: parameter editor (table row selection). Same step dict shape as graph nodes; data is separate
+        # from Flow Graph unless a future "Import / Export" or shared-model feature is added.
         right_box = QtWidgets.QGroupBox("Step parameters")
+        right_box.setToolTip(
+            "Edits the selected step in the table above. The Flow Graph tab has its own canvas and a "
+            '"Module parameters" panel on the right of the chart — same fields, but for the selected node.'
+        )
         right_layout = QtWidgets.QVBoxLayout(right_box)
         self.param_container = QtWidgets.QWidget()
         self.param_layout = QtWidgets.QFormLayout(self.param_container)
@@ -2329,7 +2350,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ===== Flow graph (visual flowchart) =====
     def _init_flow_graph(self):
-        """Visual flowchart: explicit edges (drag right port → left port)."""
+        """Visual flowchart: explicit edges (drag right port → left port).
+
+        Tab layout (horizontal, only on the Flow Graph tab):
+        - Left (stretch 1): Components, "Nodes on canvas", Add/Edit/Delete/Clear.
+        - Center (stretch 4): QGraphicsView canvas (main area).
+        - Right (stretch 2): "Module parameters" — same field types as Flow Designer "Step parameters",
+          but for the selected canvas node (graph_nodes), not the flow table (flow_steps).
+
+        Linking Flow Designer and Flow Graph is not automatic: flow_steps and graph_nodes are separate.
+        Future options: import/export buttons, one shared step list for both UIs, or a shared session file.
+        """
         container = QtWidgets.QWidget()
         layout = QtWidgets.QHBoxLayout(container)
         self.graph_layout.addWidget(container)
@@ -2399,8 +2430,34 @@ class MainWindow(QtWidgets.QMainWindow):
         ctrl_layout.addWidget(self.graph_run_btn)
         center_layout.addLayout(ctrl_layout)
 
+        # Right: module parameters — east column of this tab; fixed min width; stretch weight 2 vs center 4.
+        right_box = QtWidgets.QGroupBox("Module parameters")
+        right_box.setToolTip(
+            "Right-hand column of the Flow Graph tab. Shows the same kinds of fields as "
+            'Flow Designer → "Step parameters", but for the node you click on the canvas. '
+            "Flow Designer and Flow Graph do not share one list unless you add import/export."
+        )
+        right_outer = QtWidgets.QVBoxLayout(right_box)
+        self.graph_param_sidebar_hint = QtWidgets.QLabel(
+            "Select a node on the canvas to view and edit its parameters "
+            "(same fields as Flow Designer → Step parameters; data is separate from the flow table)."
+        )
+        self.graph_param_sidebar_hint.setWordWrap(True)
+        self.graph_param_sidebar_hint.setStyleSheet("color: palette(mid);")
+        self.graph_param_scroll = QtWidgets.QScrollArea()
+        self.graph_param_scroll.setWidgetResizable(True)
+        self.graph_param_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        self.graph_param_scroll.setMinimumWidth(240)
+        self.graph_param_widget = QtWidgets.QWidget()
+        self.graph_param_layout = QtWidgets.QFormLayout(self.graph_param_widget)
+        self.graph_param_scroll.setWidget(self.graph_param_widget)
+        right_outer.addWidget(self.graph_param_sidebar_hint)
+        right_outer.addWidget(self.graph_param_scroll, 1)
+        self.graph_param_scroll.setVisible(False)
+
         layout.addWidget(left_box, 1)
         layout.addWidget(center_box, 4)
+        layout.addWidget(right_box, 2)
 
         # Signals
         self.graph_add_btn.clicked.connect(self._on_graph_add_node)
@@ -2411,6 +2468,177 @@ class MainWindow(QtWidgets.QMainWindow):
         self.graph_run_btn.clicked.connect(self._on_graph_run)
         self.graph_fit_btn.clicked.connect(self._graph_fit_view)
         self.graph_view.connectionRequested.connect(self._on_graph_connection_requested)
+        self.graph_scene.selectionChanged.connect(self._on_graph_scene_selection_changed)
+
+    def _graph_clear_param_layout(self) -> None:
+        while self.graph_param_layout.count():
+            item = self.graph_param_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+
+    def _graph_clear_param_sidebar(self) -> None:
+        self._graph_sidebar_step = None
+        self._graph_clear_param_layout()
+        self.graph_param_sidebar_hint.setVisible(True)
+        self.graph_param_scroll.setVisible(False)
+
+    def _graph_refresh_node_canvas_label(self, node: dict) -> None:
+        item: QtWidgets.QGraphicsRectItem = node["item"]
+        old_lbl = node.get("label_item")
+        if old_lbl is not None:
+            self.graph_scene.removeItem(old_lbl)
+        text = self._describe_step(node)
+        label = self.graph_scene.addSimpleText(text if text else node.get("type", ""))
+        label.setBrush(QtGui.QBrush(QtGui.QColor("white")))
+        label.setParentItem(item)
+        label.setAcceptedMouseButtons(QtCore.Qt.MouseButton.NoButton)
+        label_rect = label.boundingRect()
+        rect = item.rect()
+        label.setPos(
+            (rect.width() - label_rect.width()) / 2,
+            (rect.height() - label_rect.height()) / 2,
+        )
+        node["label_item"] = label
+
+    def _graph_sidebar_update_move(self, step: dict, field: str, value):
+        if step not in self.graph_nodes:
+            return
+        if field in ("flowrate", "volume"):
+            try:
+                step[field] = float(value)
+            except ValueError:
+                return
+        else:
+            step[field] = value
+        self._graph_refresh_node_canvas_label(step)
+
+    def _graph_sidebar_update_wait(self, step: dict, value: str):
+        if step not in self.graph_nodes:
+            return
+        try:
+            step["seconds"] = float(value)
+        except ValueError:
+            return
+        self._graph_refresh_node_canvas_label(step)
+
+    def _graph_sidebar_update_switch(self, step: dict, field: str, value):
+        if step not in self.graph_nodes:
+            return
+        if field in ("v1", "v2", "v3", "v4"):
+            step[field] = int(value)
+        else:
+            step[field] = value
+        self._graph_refresh_node_canvas_label(step)
+
+    def _graph_build_param_sidebar_for_step(self, step: dict) -> None:
+        self._graph_sidebar_step = step
+        self._graph_clear_param_layout()
+        self.graph_param_sidebar_hint.setVisible(False)
+        self.graph_param_scroll.setVisible(True)
+        t = step.get("type")
+
+        if t == "Move syringe":
+            syringe_combo = QtWidgets.QComboBox()
+            syringe_combo.setEditable(True)
+            names = []
+            if self._board is not None and getattr(self._board, "SPS01", None) is not None:
+                for dev in self._board.SPS01:
+                    if dev is not None:
+                        names.append(str(dev.name))
+            syringe_combo.addItems(names)
+            cur = step.get("syringe") or ""
+            if cur in names:
+                syringe_combo.setCurrentText(cur)
+            elif cur:
+                syringe_combo.setEditText(cur)
+            syringe_combo.currentTextChanged.connect(
+                lambda text, s=step: self._graph_sidebar_update_move(s, "syringe", text)
+            )
+
+            flow_edit = QtWidgets.QLineEdit(str(step.get("flowrate", 100.0)))
+            flow_edit.editingFinished.connect(
+                lambda fe=flow_edit, s=step: self._graph_sidebar_update_move(
+                    s, "flowrate", fe.text()
+                )
+            )
+
+            vol_edit = QtWidgets.QLineEdit(str(step.get("volume", 10.0)))
+            vol_edit.editingFinished.connect(
+                lambda ve=vol_edit, s=step: self._graph_sidebar_update_move(s, "volume", ve.text())
+            )
+
+            self.graph_param_layout.addRow("Syringe name:", syringe_combo)
+            self.graph_param_layout.addRow("Flowrate (ul/min):", flow_edit)
+            self.graph_param_layout.addRow("Volume (ul):", vol_edit)
+
+        elif t == "Wait":
+            sec_edit = QtWidgets.QLineEdit(str(step.get("seconds", 1.0)))
+            sec_edit.editingFinished.connect(
+                lambda se=sec_edit, s=step: self._graph_sidebar_update_wait(s, se.text())
+            )
+            self.graph_param_layout.addRow("Seconds:", sec_edit)
+
+        elif t == "Switch valves":
+            manifold_combo = QtWidgets.QComboBox()
+            manifold_combo.setEditable(True)
+            names = []
+            if self._board is not None and getattr(self._board, "C4VM", None) is not None:
+                for dev in self._board.C4VM:
+                    if dev is not None:
+                        names.append(str(dev.name))
+            manifold_combo.addItems(names)
+            cur = step.get("manifold") or ""
+            if cur in names:
+                manifold_combo.setCurrentText(cur)
+            elif cur:
+                manifold_combo.setEditText(cur)
+            manifold_combo.currentTextChanged.connect(
+                lambda text, s=step: self._graph_sidebar_update_switch(s, "manifold", text)
+            )
+
+            v1_spin = QtWidgets.QSpinBox()
+            v2_spin = QtWidgets.QSpinBox()
+            v3_spin = QtWidgets.QSpinBox()
+            v4_spin = QtWidgets.QSpinBox()
+            for spin, key in [
+                (v1_spin, "v1"),
+                (v2_spin, "v2"),
+                (v3_spin, "v3"),
+                (v4_spin, "v4"),
+            ]:
+                spin.setRange(0, 1)
+                spin.setValue(int(step.get(key, 0)))
+                spin.valueChanged.connect(
+                    lambda val, k=key, s=step: self._graph_sidebar_update_switch(s, k, val)
+                )
+
+            self.graph_param_layout.addRow("Manifold name:", manifold_combo)
+            self.graph_param_layout.addRow("V1:", v1_spin)
+            self.graph_param_layout.addRow("V2:", v2_spin)
+            self.graph_param_layout.addRow("V3:", v3_spin)
+            self.graph_param_layout.addRow("V4:", v4_spin)
+
+        else:
+            info = QtWidgets.QLabel("Stop board: call StopBoard() when reaching this step.")
+            self.graph_param_layout.addRow(info)
+
+    def _graph_refresh_param_sidebar_from_board(self) -> None:
+        """Repopulate device combos after connect/disconnect."""
+        if self._graph_sidebar_step is None:
+            return
+        if self._graph_sidebar_step not in self.graph_nodes:
+            self._graph_clear_param_sidebar()
+            return
+        self._graph_build_param_sidebar_for_step(self._graph_sidebar_step)
+
+    def _on_graph_scene_selection_changed(self) -> None:
+        for item in self.graph_scene.selectedItems():
+            node = self._graph_step_for_graphics_item(item)
+            if node is not None:
+                self._graph_build_param_sidebar_for_step(node)
+                return
+        self._graph_clear_param_sidebar()
 
     def _graph_selected_component_text(self) -> Optional[str]:
         lst = self.graph_components_list
@@ -2552,6 +2780,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._graph_remove_edge_record(r)
         self.graph_scene.removeItem(node["item"])
         self.graph_nodes.remove(node)
+        if self._graph_sidebar_step is node:
+            self._graph_clear_param_sidebar()
         self._graph_refresh_nodes_bar()
 
     def _on_graph_add_node(self):
@@ -2603,27 +2833,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
         dlg = StepParamDialog(self, self._board, node)
         if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
-            item: QtWidgets.QGraphicsRectItem = node["item"]
-            old_lbl = node.get("label_item")
-            if old_lbl is not None:
-                self.graph_scene.removeItem(old_lbl)
-            text = self._describe_step(node)
-            label = self.graph_scene.addSimpleText(text if text else node["type"])
-            label.setBrush(QtGui.QBrush(QtGui.QColor("white")))
-            label.setParentItem(item)
-            label.setAcceptedMouseButtons(QtCore.Qt.MouseButton.NoButton)
-            label_rect = label.boundingRect()
-            rect = item.rect()
-            label.setPos(
-                (rect.width() - label_rect.width()) / 2,
-                (rect.height() - label_rect.height()) / 2,
-            )
-            node["label_item"] = label
+            self._graph_refresh_node_canvas_label(node)
+            if self._graph_sidebar_step is node:
+                self._graph_build_param_sidebar_for_step(node)
 
     def _on_graph_clear(self):
         self.graph_edges.clear()
         self.graph_scene.clear()
         self.graph_nodes.clear()
+        self._graph_clear_param_sidebar()
         self._graph_refresh_nodes_bar()
 
     def _on_graph_run(self):
@@ -2781,6 +2999,8 @@ class StepParamDialog(QtWidgets.QDialog):
 
 
 def main():
+    if getattr(sys, "frozen", False):
+        os.chdir(os.path.dirname(os.path.abspath(sys.executable)))
     app = QtWidgets.QApplication(sys.argv)
     app.setApplicationName("LabSmith Control")
     app.setWindowIcon(build_app_icon())

@@ -1,0 +1,11 @@
+/build/
+/dist/
+*.spec.bak
+
+__pycache__/
+*.py[cod]
+*$py.class
+
+logs/
+OUTPUT.txt
+OUTPUT_*.txt
