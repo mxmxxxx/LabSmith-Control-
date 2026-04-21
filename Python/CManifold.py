@@ -72,17 +72,75 @@ class CManifold:
             except Exception:
                 self.V_status[i - 1] = None
 
+    def _switch_context(self, v1, v2, v3, v4):
+        addr = getattr(self, "add_man", None)
+        if addr is None:
+            addr = getattr(self, "add_syr", None)
+        if addr is None:
+            addr = getattr(self, "address", "?")
+        return (
+            f"name={self.name}, addr={addr}, online={self.FlagIsOnline}, "
+            f"ready={self.FlagReady}, v1={v1}, v2={v2}, v3={v3}, v4={v4}"
+        )
+
     ### Switch Valves
-    def SwitchValves(self,v1,v2,v3,v4):
-            """CmdSetValves: 0=no change, 1=position A, 2=closed, 3=position B (uProcess)."""
-            self.device.CmdSetValves(np.int8(v1),np.int8(v2),np.int8(v3),np.int8(v4))
-            self.FlagReady = False
-            self.displayswitch(v1,v2,v3,v4)
-            while self.FlagIsDone == False:
-                self.UpdateStatus()
-                time.sleep(0.01)
-            if self.FlagIsDone == True:
-                self.displayswitchstop()
+    def SwitchValves(self, v1, v2, v3, v4):
+        """CmdSetValves: 0=no change, 1=position A, 2=closed, 3=position B (uProcess).
+
+        Raises RuntimeError if the manifold is offline / stuck at entry, or if
+        the driver command returns False. Polls hardware until done with
+        cooperative Stop-button checks (via parent board's cancel_requested /
+        poll_hook) so the GUI doesn't freeze during valve motion.
+        """
+        try:
+            self.UpdateStatus()
+        except Exception as e:
+            raise RuntimeError(
+                f"Manifold {self.name}: UpdateStatus failed before SwitchValves: {e}"
+            ) from e
+        if not self.FlagIsOnline:
+            raise RuntimeError(f"Manifold {self.name} is offline.")
+        if getattr(self, "FlagIsStuck", False):
+            raise RuntimeError(f"Manifold {self.name} is stuck.")
+
+        rv = self.device.CmdSetValves(
+            np.int8(v1), np.int8(v2), np.int8(v3), np.int8(v4)
+        )
+        if rv is False:
+            raise RuntimeError(
+                f"Manifold ({self._switch_context(v1, v2, v3, v4)}): CmdSetValves({v1},{v2},{v3},{v4}) returned False."
+            )
+        self.FlagReady = False
+        self.displayswitch(v1, v2, v3, v4)
+
+        start = time.monotonic()
+        # Valve switches should complete in well under a second. 30s is a
+        # generous ceiling that still prevents a dead manifold from hanging
+        # the GUI thread forever.
+        timeout_seconds = 30
+        while self.FlagIsDone == False:
+            if getattr(self.Lboard, "cancel_requested", False) or \
+               getattr(self.Lboard, "Stop", False):
+                break
+            hook = getattr(self.Lboard, "poll_hook", None)
+            if callable(hook):
+                try:
+                    hook()
+                except Exception:
+                    pass
+            self.UpdateStatus()
+            if getattr(self, "FlagIsStuck", False):
+                raise RuntimeError(
+                    f"Manifold {self.name} got stuck during switch."
+                )
+            if time.monotonic() - start > timeout_seconds:
+                raise RuntimeError(
+                    f"Manifold {self.name} switch timed out after "
+                    f"{timeout_seconds}s."
+                )
+            time.sleep(0.01)
+        if self.FlagIsDone == True:
+            self.displayswitchstop()
 
     def SetValvesNative(self, v1, v2, v3, v4):
         """Set all four valves with native semantics (0–3); waits until done."""
@@ -110,4 +168,3 @@ class CManifold:
             OUTPUT.write(comment + "\n")
             print(comment)
         self.FlagReady = True
-

@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "type": "flow_graph",
+  "nodes": [
+    {"id": "n0", "type": "Move syringe", "syringe": "SPS01_1", "flowrate": 100.0, "volume": 30.0, "x": 50, "y": 50},
+    {"id": "n1", "type": "Wait", "seconds": 2.0, "x": 250, "y": 50}
+  ],
+  "edges": [
+    {"src_id": "n0", "dst_id": "n1"},
+    {"src_id": "n1", "dst_id": "n99"}
+  ]
+}

@@ -28,15 +28,24 @@ class LabsmithBoard:
         self.port = port
 
         ## Flags
-        self.isConnected = False 
-        self.isDisconnected = True 
-        self.Stop = False 
-        self.Pause = False 
-        self.Resume = False 
-        self.flag_break_countpause = 0 
-        self.flag_break_stop = 0 
+        self.isConnected = False
+        self.isDisconnected = True
+        self.Stop = False
+        self.Pause = False
+        self.Resume = False
+        self.flag_break_countpause = 0
+        self.flag_break_stop = 0
         self.flag_a = 0   # # flag used in listener of MoveWait function used to print just the initial target waiting time
         self.flag_b = 0   # # flag used in listener of MoveWait function used to print just the initial target waiting time
+
+        ## Cooperative cancellation + UI-event pump.
+        # GUI sets poll_hook = QApplication.processEvents before a long run so
+        # hardware-polling loops (CSyringe.Updating, CManifold.SwitchValves) can
+        # keep the UI responsive and see Stop button clicks. cancel_requested is
+        # set by StopBoard() and checked by the same loops to exit early.
+        # Clearing both is GUI's responsibility before/after each run.
+        self.poll_hook = None
+        self.cancel_requested = False
                    
         ## Clocks
         self.ClockStartConnection = None
@@ -170,8 +179,53 @@ class LabsmithBoard:
                 self.CEP01[i] = CEP01Board(self, add)
                 self.CEP01[i].address = int(add)
 
+    def connected_devices(self):
+        """Return connected SPS01/C4VM devices as UI-neutral dictionaries.
+
+        This is a read-only registry view. It reuses cached wrapper attributes
+        and does not call GetName() or any COM/uProcess method.
+        """
+        out = []
+        sps01 = getattr(self, "SPS01", None)
+        if sps01 is not None:
+            for idx, dev in enumerate(sps01):
+                if dev is None:
+                    continue
+                addr = getattr(dev, "add_syr", None)
+                if addr is None:
+                    addr = getattr(dev, "address", None)
+                out.append({
+                    "type": "syringe",
+                    "index": idx,
+                    "addr": addr,
+                    "name": str(getattr(dev, "name", "")),
+                })
+
+        c4vm = getattr(self, "C4VM", None)
+        if c4vm is not None:
+            for idx, dev in enumerate(c4vm):
+                if dev is None:
+                    continue
+                addr = getattr(dev, "add_man", None)
+                if addr is None:
+                    addr = getattr(dev, "add_syr", None)
+                if addr is None:
+                    addr = getattr(dev, "address", None)
+                out.append({
+                    "type": "manifold",
+                    "index": idx,
+                    "addr": addr,
+                    "name": str(getattr(dev, "name", "")),
+                })
+        return out
+
     ### Stop
     def StopBoard(self):
+        # Signal cooperative cancellation to any polling loops running in the
+        # same thread (CSyringe.Updating, CManifold.SwitchValves, MoveWait wait
+        # loop). They check this flag each tick and break out.
+        self.cancel_requested = True
+        self.Stop = True
         for i in range(len(self.SPS01)):
             self.SPS01[i].device.CmdStop()
             self.SPS01[i].FlagReady = True
@@ -3428,215 +3482,196 @@ class LabsmithBoard:
             self.CEP01[i].UpdateStatus()
 
     ## Wait Movement
+    # Rewritten 2026-04-19 (Phase 1 terminal review). Previous implementation
+    # had seven numbered runtime defects (missing listener dispatcher branches
+    # for 3/4 pumps, a variable-name-mismatch NameError, missing parentheses
+    # on several board-control method calls, an iterator TypeError in the
+    # 2-pump inner loop, list-aliasing pollution, and a truncated 2-pump
+    # pause-resume path). All paths now flow through a data-driven N-pump
+    # core (`CheckFirstDoneStopPauseWait`) that takes a `pumps` list of
+    # (index, name, volume) triples. The public `MoveWait(time, d1, v1, ...,
+    # d8, v8)` signature is preserved for backward compatibility with
+    # external scripts such as MoveWaitScript.py.
     def MoveWait(self,time,d1 = None, v1 = None, d2 = None, v2 = None, d3 = None, v3 = None, d4 = None, v4 = None, d5 = None, v5 = None, d6 = None, v6 = None, d7 = None, v7 = None, d8 = None, v8 = None):
-        t_s=datetime.now()
+        t_s = datetime.now()
         self.flag_break_countpause = 0
         self.flag_break_stop = 0
-        if self.Stop == False:
-            if [d1, v1, d2, v2, d3, v3, d4, v4, d5, v5, d6, v6, d7, v7, d8, v8].count(None)%2 != 0:
-                comment="Error, missing input. Number of inputs has to be even (time, name of syringes and corresponding flow rates)."
-                with open(output_txt_path(),"a") as OUTPUT:
-                    OUTPUT.write(comment +"\n")
-                    print(comment) 
+        if self.Stop == True:
+            return
+
+        # Collapse the positional pairs into a normalised list.
+        raw_pairs = [
+            (d1, v1), (d2, v2), (d3, v3), (d4, v4),
+            (d5, v5), (d6, v6), (d7, v7), (d8, v8),
+        ]
+        all_positions = [d1, v1, d2, v2, d3, v3, d4, v4,
+                         d5, v5, d6, v6, d7, v7, d8, v8]
+        if all_positions.count(None) % 2 != 0:
+            comment = ("Error, missing input. Number of inputs has to be even "
+                       "(time, name of syringes and corresponding flow rates).")
+            with open(output_txt_path(), "a") as OUTPUT:
+                OUTPUT.write(comment + "\n")
+                print(comment)
+            return
+
+        pairs = [(d, v) for (d, v) in raw_pairs if d is not None and v is not None]
+        if not pairs:
+            comment = "Error, MoveWait called without any (name, volume) pairs."
+            with open(output_txt_path(), "a") as OUTPUT:
+                OUTPUT.write(comment + "\n")
+                print(comment)
+            return
+
+        n = len(pairs)
+        if n > 4:
+            comment = f"MoveWait supports up to 4 concurrent pumps, got {n}."
+            with open(output_txt_path(), "a") as OUTPUT:
+                OUTPUT.write(comment + "\n")
+                print(comment)
+            return
+        if len(self.SPS01) < n:
+            comment = (f"MoveWait: not enough pumps on board "
+                       f"(need {n}, have {len(self.SPS01)}).")
+            with open(output_txt_path(), "a") as OUTPUT:
+                OUTPUT.write(comment + "\n")
+                print(comment)
+            return
+
+        # Resolve pump indices up-front; `pumps` is a list of (index, name, volume).
+        pumps = [(self.FindIndexS(d), d, v) for (d, v) in pairs]
+
+        # Register the listener before issuing hardware commands so a fast-completing
+        # pump cannot notify before the listener is in place.
+        self.addlistener(
+            'FirstDoneStopPauseWait',
+            "listener_firstdonepausewait",
+            self.CheckFirstDoneStopPauseWait,
+            [time, pumps, t_s],
+        )
+
+        # Only start the move when every targeted pump is ready.
+        if all(self.SPS01[i].FlagIsDone == True for (i, _, _) in pumps):
+            for (i, _, vol) in pumps:
+                self.SPS01[i].device.CmdMoveToVolume(vol)
+                self.SPS01[i].FlagReady = False
+            for (i, _, _) in pumps:
+                self.SPS01[i].displaymovement()
+            if all(self.SPS01[i].FlagIsMoving == True for (i, _, _) in pumps):
+                self.notify('FirstDoneStopPauseWait')
+
+    ## Listener Function : Display the first device to be done and Stop and Pause and check the WAIT (called in MoveWait)
+    # Unified N-pump handler. Expected args layout: [t, pumps, ts]
+    #   t: int countdown seconds
+    #   pumps: list of (pump_index, pump_name, target_volume)
+    #   ts: datetime start timestamp
+    # A single loop drains the pumps list as each pump reports FlagIsDone. Stop/Pause
+    # are checked every tick; Resume re-enters MoveWait with only the pumps that
+    # haven't finished yet.
+    def CheckFirstDoneStopPauseWait(self, *args):
+        if len(args) != 3:
+            comment = (f"MoveWait listener: unexpected arg count {len(args)} "
+                       f"(expected 3 — upgrade path from old flat args layout).")
+            with open(output_txt_path(), "a") as OUTPUT:
+                OUTPUT.write(comment + "\n")
+                print(comment)
+            return
+
+        t_raw, pumps, ts = args
+        # Accept either int seconds or a timedelta (re-entry from Pause/Resume may pass
+        # a remaining-time value that was computed as timedelta).
+        try:
+            t = int(t_raw)
+        except (TypeError, ValueError):
+            try:
+                t = int(t_raw.total_seconds())
+            except AttributeError:
+                comment = f"MoveWait listener: bad time argument {t_raw!r}."
+                with open(output_txt_path(), "a") as OUTPUT:
+                    OUTPUT.write(comment + "\n")
+                    print(comment)
+                return
+        if t < 0:
+            t = 0
+
+        remaining = list(pumps)  # [(i, d, v), ...]
+        scan_rate = 0.1
+        target = 48 * 60 * 60  # max pause window (~48h)
+        var_not_disp = 0
+
+        if not remaining:
+            return
+        if not all(self.SPS01[i].FlagIsMoving == True for (i, _, _) in remaining):
+            return
+
+        for _tick in range(t):
+            if self.Stop == True:
+                self.StopBoard()
+                self.flag_break_stop = 1
+                break
+
+            if self.Pause == True:
+                self.PauseBoard()
+                te = datetime.now() - ts
+                try:
+                    diff_seconds = max(0, int(t - te.total_seconds()))
+                except AttributeError:
+                    diff_seconds = max(0, int(t - te))
+
+                for _pause_tick in range(target):
+                    if self.Stop == True:
+                        break
+                    if self.Resume == True:
+                        self.ClockResume = datetime.now()
+                        with open(output_txt_path(), "a") as OUTPUT:
+                            comment = f"{self.ClockResume.strftime('%X')} Interface resumed by the user."
+                            OUTPUT.write(comment + "\n")
+                            print(comment)
+                        for (i, _, _) in remaining:
+                            self.SPS01[i].UpdateStatus()
+                        self.flag_a += 1
+                        reentry_args = []
+                        for (_, d, v) in remaining:
+                            reentry_args.extend([d, v])
+                        self.MoveWait(diff_seconds, *reentry_args)
+                        self.flag_break_countpause = 1
+                        self.flag_b += 1
+                        break
+                    time.sleep(scan_rate)
+
+                if self.flag_break_countpause == 1:
+                    break
+                if self.Stop == True:
+                    # Allow the outer iteration to handle Stop uniformly.
+                    continue
             else:
-                if v1 != None and d2 == None: ## 1 syringe as input
-                    i1=self.FindIndexS(d1)
-                    self.addlistener('FirstDoneStopPauseWait', "listener_firstdonepausewait", self.CheckFirstDoneStopPauseWait, [time, i1,d1,v1,t_s]) ##it listens for the syringe FlagIsMoving == true, so it updtades continuously the state to determine the end of the command. It results in FlagReady = true again.
-                    if len(self.SPS01) == 1:
-                        if self.SPS01[i1].FlagIsDone == True:
-                            self.SPS01[i1].device.CmdMoveToVolume(v1) 
-                            self.SPS01[i1].FlagReady = False
-                            self.SPS01[i1].displaymovement()                              
-                            if self.SPS01[i1].FlagIsMoving == True:
-                                self.notify('FirstDoneStopPauseWait')
-                elif v2 != None and d3 == None: ## 2 syringes as input
-                    i1=self.FindIndexS(d1)
-                    i2=self.FindIndexS(d2)
-                    self.addlistener('FirstDoneStopPauseWait', "listener_firstdonepausewait", self.CheckFirstDoneStopPauseWait, [time,i1,d1,v1,i2,d2,v2,t_s]) ##it listens for the syringe FlagIsMoving == true, so it updtades continuously the state to determine the end of the command. It results in FlagReady = true again.
-                    if len(self.SPS01) == 2:
-                        if self.SPS01[i1].FlagIsDone == True and self.SPS01[i2].FlagIsDone == True:
-                            self.SPS01[i1].device.CmdMoveToVolume(v1)
-                            self.SPS01[i2].device.CmdMoveToVolume(v2)
-                            self.SPS01[i1].FlagReady = False
-                            self.SPS01[i2].FlagReady = False
-                            self.SPS01[i1].displaymovement()
-                            self.SPS01[i2].displaymovement()  
-                            if self.SPS01[i1].FlagIsMoving == True and self.SPS01[i2].FlagIsMoving == True:
-                                self.notify('FirstDoneStopPauseWait')
-                elif v3 != None and d4 == None: ## 3 syringes as input
-                    i1=self.FindIndexS(d1)
-                    i2=self.FindIndexS(d2)
-                    i3=self.FindIndexS(d3)
-                    self.addlistener('FirstDoneStopPauseWait', "listener_firstdonepausewait", self.CheckFirstDoneStopPauseWait, [time,i1,d1,v1,i2,d2,v2,d3,v3,t_s]) ##it listens for the syringe FlagIsMoving == true, so it updtades continuously the state to determine the end of the command. It results in FlagReady = true again.
-                    if len(self.SPS01) == 3:
-                        if self.SPS01[i1].FlagIsDone == True and self.SPS01[i2].FlagIsDone == True and self.SPS01[i3].FlagIsDone == True:
-                            self.SPS01[i1].device.CmdMoveToVolume(v1)
-                            self.SPS01[i2].device.CmdMoveToVolume(v2)
-                            self.SPS01[i3].device.CmdMoveToVolume(v3)
-                            self.SPS01[i1].FlagReady = False
-                            self.SPS01[i2].FlagReady = False
-                            self.SPS01[i3].FlagReady = False
-                            self.SPS01[i1].displaymovement()
-                            self.SPS01[i2].displaymovement()
-                            self.SPS01[i3].displaymovement()
-                            if self.SPS01[i1].FlagIsMoving == True and self.SPS01[i2].FlagIsMoving == True and self.SPS01[i3].FlagIsMoving == True:
-                                self.notify('FirstDoneStopPauseWait')
-        elif v4 != None and d5 == None: ## 4 syringes as input:
-                    i1=self.FindIndexS(d1)
-                    i2=self.FindIndexS(d2)
-                    i3=self.FindIndexS(d3)
-                    i4=self.FindIndexS(d4)
-                    self.addlistener('FirstDoneStopPauseWait', "listener_firstdonepausewait", self.CheckFirstDoneStopPauseWait, [time,i1,d1,v1,i2,d2,v2,d3,v3,d4,v4,t_s]) ##it listens for the syringe FlagIsMoving == true, so it updtades continuously the state to determine the end of the command. It results in FlagReady = true again.
-                    if len(self.SPS01) == 4:
-                        if self.SPS01[i1].FlagIsDone == True and self.SPS01[i2].FlagIsDone == True and self.SPS01[i3].FlagIsDone == True and self.SPS01[i4].FlagIsDone == True:
-                            self.SPS01[i1].device.CmdMoveToVolume(v1)
-                            self.SPS01[i2].device.CmdMoveToVolume(v2)
-                            self.SPS01[i3].device.CmdMoveToVolume(v3)
-                            self.SPS01[i4].device.CmdMoveToVolume(v4)
-                            self.SPS01[i1].FlagReady = False
-                            self.SPS01[i2].FlagReady = False
-                            self.SPS01[i3].FlagReady = False
-                            self.SPS01[i4].FlagReady = False
-                            self.SPS01[i1].displaymovement()
-                            self.SPS01[i2].displaymovement()
-                            self.SPS01[i3].displaymovement()                                
-                            self.SPS01[i4].displaymovement()
-                            if self.SPS01[i1].FlagIsMoving == True and self.SPS01[i2].FlagIsMoving == True and self.SPS01[i3].FlagIsMoving == True and self.SPS01[i4].FlagIsMoving == True:
-                                self.notify('FirstDoneStopPauseWait')
+                for (i, _, _) in remaining:
+                    if self.SPS01[i].FlagIsMoving == True:
+                        self.SPS01[i].UpdateStatus()
 
-    ## Listener Function : Display the first device to be done and Stop and Pause and chech the WAIT (called in MoveWait)
-    def CheckFirstDoneStopPauseWait(self,*args):
-        if len(args) == 5:
-            t=args[0]
-            i1=args[1]
-            d1=args[2]
-            v1=args[3]
-            ts=args[4]
-            var_not_disp=0
-            if self.SPS01[i1].FlagIsMoving == True:
-                scan_rate=0.1
-                target=(48)*60*60#scan_rate
-                for count1 in range(t):
-                    if self.Stop == True:
-                        self.StopBoard()
-                        self.flag_break_stop = 1
-                        break
-                    elif self.Pause == True:
-                        self.PauseBoard()
-                        te = datetime.now()
-                        te = te - ts
-                        difftime = t - te
-                        for count_pause1 in range(target):
-                            if self.Stop == True:
-                                break
-                            elif self.Resume == True:
-                                self.ClockResume = datetime.now()
-                                with open(output_txt_path(), "a") as OUTPUT:
-                                    comment = f"{self.ClockResume.strftime('%X')} Interface resumed by the user."
-                                    OUTPUT.write(comment + "\n")
-                                    print(comment)
-                                self.SPS01[i1].UpdateStatus()
-                                self.flag_a +=1
-                                self.MoveWait(diff_time, d1, v1)
-                                self.flag_break_countpause = 1
-                                self.flag_b +=1
-                                break
-                            time.sleep(scan_rate)
-                    elif self.SPS01[i1].FlagIsMoving == True:
-                        self.SPS01[i1].UpdateStatus()
-                    if self.flag_break_countpause == 1:
-                        break
-                    elif self.SPS01[i1].FlagIsDone == True:
-                        self.SPS01[i1].displaymovementstop()
-                        var_not_disp = 1
-                        break
-                    time.sleep(0)
-                if self.flag_break_stop == 0 and var_not_disp == 0:
-                    self.WaitStopBoard
-                    self.UpdateBoard
-                    if self.flag_b == self.flag_a:
-                        self.displaymovementstopwait(t)
-                        self.flag_a = 0
-                        self.flag_b = 0
+            # Harvest any pumps that just finished. Process high-to-low so pop() is safe.
+            just_done_positions = [
+                k for k, (i, _, _) in enumerate(remaining)
+                if self.SPS01[i].FlagIsDone == True
+            ]
+            if just_done_positions:
+                for k in sorted(just_done_positions, reverse=True):
+                    (i, _, _) = remaining[k]
+                    self.SPS01[i].displaymovementstop()
+                    remaining.pop(k)
+                if not remaining:
+                    var_not_disp = 1
+                    break
 
-        elif len(args) == 8:
-            t=args[0]
-            i1=args[1]
-            d1=args[2]
-            v1=args[3]
-            i2=args[4]
-            d2=args[5]
-            v2=args[6]
-            i=[i1, i2]
-            d=[d1, d2]
-            v=[v1, v2]
-            ts=args[7]
-            var_not_disp = 0
-            if self.SPS01[ i1].FlagIsMoving == True and self.SPS01[ i2].FlagIsMoving == True:
-                scan_rate=0.1
-                target=(48)*60*60#scan_rate
-                for count1 in range(t):
-                    if self.Stop == True:
-                        self.StopBoard
-                        self.flag_break_stop = 1
-                        break
-                    elif self.Pause == True:
-                        self.PauseBoard
-                        te = datetime.now()
-                        te=te - ts
-                        diff_time=t-te
-                        for count_pause1 in range(target):
-                            if self.Stop == True:
-                                break
-                            elif self.Resume == True:
-                                self.ClockResume = datetime.now()
-                                with open(output_txt_path(), "a") as OUTPUT:
-                                    comment = f"{self.ClockResume.strftime('%X')} Interface resumed by the user."
-                                    OUTPUT.write(comment + "\n")
-                                    print(comment)
-                                self.SPS01[i1].UpdateStatus()
-                                self.SPS01[i2].UpdateStatus()
-                                self.flag_a +=1 
-                                self.MoveWait(diff_time, d1, v1, d2, v2)
-                                self.flag_break_countpause = 1
-                                self.flag_b += 1
-                                break
-                            time.sleep(scan_rate)
-                    elif self.SPS01[i1].FlagIsMoving == True and self.SPS01[ i2].FlagIsMoving == True:
-                        self.SPS01[i1].UpdateStatus()
-                        self.SPS01[i2].UpdateStatus()
-                    if self.flag_break_countpause == 1:
-                        break
-                    elif self.SPS01[ i1].FlagIsDone == True or self.SPS01[i2].FlagIsDone == True:
-                        for j in len(i):
-                            if self.SPS01[i[j]].FlagIsDone == True:
-                                self.SPS01[i[j]].displaymovementstop()
-                                te = datetime.now()
-                                te = te - ts
-                                t1=(t-te)
-                                ts=datetime.now()
-                                a=i
-                                a[j]=[]
-                                ad=d
-                                ad[j]=[]
-                                av=v
-                                av[j]=[]
-                                for count2 in range(t1):
-                                    if self.Stop == True:
-                                        self.StopBoard
-                                        self.flag_break_stop = 1
-                                        break
-                                    elif self.Pause == True:
-                                        self.PauseBoard
-                                        te = datetime.now()
-                                        te = te - ts
-                                        diff_time=t-te
-                                        for count_pause1 in range(target):
-                                            if self.Stop == True:
-                                                break
-                                            elif self.Resume == True:
-                                                self.ClockResume = datetime.now()
-                                            
+            time.sleep(0)
+
+        if self.flag_break_stop == 0 and var_not_disp == 0:
+            self.WaitStopBoard()
+            self.UpdateBoard()
+            if self.flag_b == self.flag_a:
+                self.displaymovementstopwait(t)
+                self.flag_a = 0
+                self.flag_b = 0
+
     ## Set Valves2 It allows the pause too
     def SetValves2(self, d1 = None,v11 = None,v12 = None,v13 = None, v14 = None, d2 = None, v21 = None, v22 = None, v23 = None, v24 = None):
         self.flag_break_countpause = 0
@@ -3689,7 +3724,7 @@ class LabsmithBoard:
                                 break
                             elif self.Resume == True:
                                 with open(output_txt_path(), "a") as OUTPUT:
-                                    comment = f"{self.ClockStop.strftime('#X')}  Interface resumed by the user."
+                                    comment = f"{self.ClockStop.strftime('%X')}  Interface resumed by the user."
                                     OUTPUT.write(comment + "\n")
                                     print(comment)
                                 self.SetValves2(d1,v11,v12,v13,v14)                                    

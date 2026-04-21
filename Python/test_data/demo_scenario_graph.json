@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "type": "flow_graph",
+  "_comment_for_customer": "Graph form of the same two-reagent mix + rinse demo. 8 nodes in a single chain. Nodes are laid out left-to-right at y=200 with x steps of 180 to keep the canvas readable.",
+  "nodes": [
+    {"id": "n0", "type": "Switch valves", "manifold": "C4VM_10", "v1": 1, "v2": 0, "v3": 0, "v4": 0, "x": 60,  "y": 200},
+    {"id": "n1", "type": "Move syringe",  "syringe": "SPS01_1", "flowrate": 100.0, "volume": 50.0,  "x": 240, "y": 200},
+    {"id": "n2", "type": "Wait",          "seconds": 3.0,                                          "x": 420, "y": 200},
+    {"id": "n3", "type": "Move syringe",  "syringe": "SPS01_2", "flowrate": 100.0, "volume": 50.0,  "x": 600, "y": 200},
+    {"id": "n4", "type": "Wait",          "seconds": 30.0,                                         "x": 780, "y": 200},
+    {"id": "n5", "type": "Switch valves", "manifold": "C4VM_10", "v1": 0, "v2": 1, "v3": 0, "v4": 0, "x": 960, "y": 200},
+    {"id": "n6", "type": "Move syringe",  "syringe": "SPS01_1", "flowrate": 200.0, "volume": 200.0, "x": 1140,"y": 200},
+    {"id": "n7", "type": "Stop board",                                                             "x": 1320,"y": 200}
+  ],
+  "edges": [
+    {"src_id": "n0", "dst_id": "n1"},
+    {"src_id": "n1", "dst_id": "n2"},
+    {"src_id": "n2", "dst_id": "n3"},
+    {"src_id": "n3", "dst_id": "n4"},
+    {"src_id": "n4", "dst_id": "n5"},
+    {"src_id": "n5", "dst_id": "n6"},
+    {"src_id": "n6", "dst_id": "n7"}
+  ]
+}

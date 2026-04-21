@@ -1,0 +1,52 @@
+{
+  "version": 1,
+  "type": "flow_designer",
+  "_comment_for_customer": "Demo scenario: two-reagent mix + rinse. Replace SPS01_1/SPS01_2/C4VM_10 with the GetName() values reported on your hardware (see Bus modules tab).",
+  "steps": [
+    {
+      "type": "Switch valves",
+      "manifold": "C4VM_10",
+      "v1": 1,
+      "v2": 0,
+      "v3": 0,
+      "v4": 0
+    },
+    {
+      "type": "Move syringe",
+      "syringe": "SPS01_1",
+      "flowrate": 100.0,
+      "volume": 50.0
+    },
+    {
+      "type": "Wait",
+      "seconds": 3.0
+    },
+    {
+      "type": "Move syringe",
+      "syringe": "SPS01_2",
+      "flowrate": 100.0,
+      "volume": 50.0
+    },
+    {
+      "type": "Wait",
+      "seconds": 30.0
+    },
+    {
+      "type": "Switch valves",
+      "manifold": "C4VM_10",
+      "v1": 0,
+      "v2": 1,
+      "v3": 0,
+      "v4": 0
+    },
+    {
+      "type": "Move syringe",
+      "syringe": "SPS01_1",
+      "flowrate": 200.0,
+      "volume": 200.0
+    },
+    {
+      "type": "Stop board"
+    }
+  ]
+}

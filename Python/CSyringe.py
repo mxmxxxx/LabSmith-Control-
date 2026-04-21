@@ -94,16 +94,56 @@ class CSyringe:
                 OUTPUT.write(comment + "\n")
                 print(comment)
 
-    ### MoveTo        
-    def MoveTo(self,flowrate,volume):
-        if self.FlagIsDone == True:
-            self.device.CmdSetFlowrate(flowrate)
-            self.Flowrate = flowrate
-            self.device.CmdMoveToVolume(volume)
-            self.FlagReady = False
-            self.displaymovement()
-            if self.FlagIsMoving == True:
-                self.notify('MovingState')
+    def _move_context(self, flowrate, volume):
+        addr = getattr(self, "add_syr", None)
+        if addr is None:
+            addr = getattr(self, "address", "?")
+        return (
+            f"name={self.name}, addr={addr}, "
+            f"online={self.FlagIsOnline}, stalled={self.FlagIsStalled}, "
+            f"ready={self.FlagReady}, flowrate={flowrate}, volume={volume}"
+        )
+
+    ### MoveTo
+    def MoveTo(self, flowrate, volume):
+        """Send flowrate+volume commands to the pump.
+
+        Raises RuntimeError if the pump is offline / stalled / busy at entry, or
+        if a driver command returns False (uProcess convention: truthy==ok).
+        Previously this silently no-op'd when FlagIsDone was False, which caused
+        Flow Designer to mark the step green ("success") even when nothing ran.
+        """
+        try:
+            self.UpdateStatus()
+        except Exception as e:
+            raise RuntimeError(
+                f"Syringe {self.name}: UpdateStatus failed before MoveTo: {e}"
+            ) from e
+        if not self.FlagIsOnline:
+            raise RuntimeError(f"Syringe {self.name} is offline.")
+        if self.FlagIsStalled:
+            raise RuntimeError(f"Syringe {self.name} is stalled.")
+        if not self.FlagIsDone:
+            raise RuntimeError(
+                f"Syringe {self.name} is busy (FlagIsDone=False) — wait for the "
+                f"previous move to finish before issuing a new one."
+            )
+
+        rv = self.device.CmdSetFlowrate(flowrate)
+        if rv is False:
+            raise RuntimeError(
+                f"Syringe ({self._move_context(flowrate, volume)}): CmdSetFlowrate({flowrate}) returned False."
+            )
+        self.Flowrate = flowrate
+        rv = self.device.CmdMoveToVolume(volume)
+        if rv is False:
+            raise RuntimeError(
+                f"Syringe ({self._move_context(flowrate, volume)}): CmdMoveToVolume({volume}) returned False."
+            )
+        self.FlagReady = False
+        self.displaymovement()
+        if self.FlagIsMoving == True:
+            self.notify('MovingState')
 
     ### Display movement In and Out on cmdwindow              
     def displaymovement(self):
@@ -131,9 +171,39 @@ class CSyringe:
     
     ### Listener function
     def Updating(self):
+        """Poll hardware until the pump reports done, raises on stall/timeout.
+
+        Cooperates with the GUI via the parent board's `poll_hook`
+        (QApplication.processEvents) so the Stop button stays clickable during
+        long moves, and `cancel_requested` flag so Stop can break the loop.
+        """
         if self.FlagIsMoving == True:
+            start = time.monotonic()
+            # Safety ceiling: real LabSmith moves complete in seconds-to-minutes.
+            # 2 hours is well past any realistic single move — if we hit it the
+            # pump is genuinely stuck and hanging the GUI thread isn't helpful.
+            timeout_seconds = 2 * 60 * 60
             while self.FlagIsMoving == True:
+                if getattr(self.Lboard, "cancel_requested", False) or \
+                   getattr(self.Lboard, "Stop", False):
+                    break
+                hook = getattr(self.Lboard, "poll_hook", None)
+                if callable(hook):
+                    try:
+                        hook()
+                    except Exception:
+                        # A hook failure must not block hardware polling.
+                        pass
                 self.UpdateStatus()
+                if self.FlagIsStalled:
+                    raise RuntimeError(
+                        f"Syringe {self.name} stalled during move."
+                    )
+                if time.monotonic() - start > timeout_seconds:
+                    raise RuntimeError(
+                        f"Syringe {self.name} move timed out after "
+                        f"{timeout_seconds}s."
+                    )
                 time.sleep(0.01)
             if self.FlagIsDone == True:
                 self.displaymovementstop()

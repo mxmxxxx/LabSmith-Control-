@@ -2,6 +2,7 @@ import sys
 import os
 import time
 import math
+import json
 import itertools
 from typing import Callable, Optional
 from PyQt6 import QtWidgets, QtCore, QtGui
@@ -11,6 +12,7 @@ except Exception:
     list_ports = None
 
 from LabsmithBoard import LabsmithBoard
+from device_registry import LEGACY_MANIFOLD_RE, LEGACY_SYRINGE_RE, resolve_device_ref
 from output_log import app_writable_root, log_directory, output_txt_path
 
 
@@ -44,6 +46,49 @@ def interruptible_sleep(seconds: float) -> None:
             break
         QtWidgets.QApplication.processEvents()
         time.sleep(min(0.08, rem))
+
+
+def _is_valid_number(value) -> bool:
+    """True iff value is a genuine finite numeric (not bool).
+
+    Python's `isinstance(True, int) == True` means bool leaks through a naive
+    `isinstance(v, (int, float))` check. JSON booleans (``true``/``false``) in a
+    ``flowrate`` / ``volume`` / ``seconds`` field would silently be accepted as
+    1 or 0, so we reject bool explicitly here.
+    """
+    if isinstance(value, bool):
+        return False
+    if not isinstance(value, (int, float)):
+        return False
+    return math.isfinite(value)
+
+
+def _board_connected_devices(board) -> list:
+    if board is None:
+        return []
+    getter = getattr(board, "connected_devices", None)
+    if not callable(getter):
+        return []
+    try:
+        return list(getter())
+    except Exception:
+        return []
+
+
+def _device_names_from_board(board, kind: str) -> list:
+    device_kind = str(kind or "").strip().lower()
+    return [
+        str(d.get("name", ""))
+        for d in _board_connected_devices(board)
+        if str(d.get("type", "")).strip().lower() == device_kind
+        and str(d.get("name", "")).strip()
+    ]
+
+
+# Max items accepted from a JSON Flow / Graph file. A typical experiment has
+# <50 steps; 1000 is a soft ceiling to prevent a malformed file from spinning
+# the UI while it builds ten-thousand-row tables.
+MAX_FLOW_ITEMS = 1000
 
 
 ACCENT = QtGui.QColor(0, 168, 232)  # modern cyan
@@ -702,8 +747,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._busy_depth = 0
         self._connect_in_progress = False
-        self._connect_thread: QtCore.QThread | None = None
-        self._connect_worker: ConnectWorker | None = None
+        self._connect_thread: Optional[QtCore.QThread] = None
+        self._connect_worker: Optional["ConnectWorker"] = None
 
         busy_wrap = QtWidgets.QWidget()
         busy_lay = QtWidgets.QHBoxLayout(busy_wrap)
@@ -723,7 +768,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if geom is not None:
             self.restoreGeometry(geom)
 
-        self._board: LabsmithBoard | None = None
+        self._board: Optional[LabsmithBoard] = None
 
         central = QtWidgets.QWidget(self)
         self.setCentralWidget(central)
@@ -748,6 +793,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
         bus_tab = QtWidgets.QWidget()
         bus_layout = QtWidgets.QVBoxLayout(bus_tab)
+
+        self.device_table = QtWidgets.QTableWidget(0, 4)
+        self.device_table.setHorizontalHeaderLabels(["Name", "Type", "Address", "Online"])
+        self.device_table.horizontalHeader().setStretchLastSection(True)
+        self.device_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.device_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        bus_layout.addWidget(self.device_table, 1)
+
         self.bus_text = QtWidgets.QPlainTextEdit()
         self.bus_text.setReadOnly(True)
         self.bus_text.setPlaceholderText(
@@ -1189,6 +1242,70 @@ class MainWindow(QtWidgets.QMainWindow):
             self._busy_label.hide()
             self._busy_label.clear()
 
+    # ===== Run-time cooperative cancellation plumbing =====
+    def _prepare_board_for_run(self):
+        """Reset board control flags and install the GUI event pump.
+
+        The poll_hook lets long hardware-polling loops in CSyringe.Updating /
+        CManifold.SwitchValves process Qt events every tick, so the Stop button
+        stays responsive and redraws happen while a Move is in flight. Flags
+        are reset because a previous StopBoard() call leaves them set, which
+        would otherwise cause the next run to abort immediately.
+        """
+        if self._board is None:
+            return
+        self._board.Stop = False
+        self._board.Pause = False
+        self._board.Resume = False
+        self._board.cancel_requested = False
+        self._board.poll_hook = QtWidgets.QApplication.processEvents
+
+    def _finalize_board_after_run(self):
+        """Clear the poll_hook so the board object doesn't retain a reference
+        to a Qt function after the run finishes."""
+        if self._board is None:
+            return
+        self._board.poll_hook = None
+
+    def _run_cancelled(self) -> bool:
+        """True when the user requested Stop while a run is in progress."""
+        if self._board is None:
+            return False
+        return bool(
+            getattr(self._board, "cancel_requested", False)
+            or getattr(self._board, "Stop", False)
+        )
+
+    def _connected_device_entries(self) -> list:
+        return _board_connected_devices(self._board)
+
+    def _device_names(self, kind: str) -> list:
+        return _device_names_from_board(self._board, kind)
+
+    def _build_device_combo(self, kind: str, current_text: str = ""):
+        """Build Flow Designer / Flow Graph device dropdowns from connected_devices()."""
+        combo = QtWidgets.QComboBox()
+        combo.setEditable(True)
+        names = self._device_names(kind)
+        combo.addItems(names)
+        cur = str(current_text or "").strip()
+        if cur:
+            if cur in names:
+                combo.setCurrentText(cur)
+            else:
+                combo.setEditText(cur)
+        line_edit = combo.lineEdit()
+        if line_edit is not None:
+            line_edit.setPlaceholderText("Pick connected device or type legacy name")
+        return combo
+
+    def _refresh_device_dropdowns(self) -> None:
+        self._populate_device_names()
+        row = self.flow_table.currentRow() if hasattr(self, "flow_table") else -1
+        if 0 <= row < len(getattr(self, "flow_steps", [])):
+            self._build_param_editor_for_step(self.flow_steps[row])
+        self._graph_refresh_param_sidebar_from_board()
+
     def _set_busy_message(self, message: str):
         self._busy_label.setText(message)
         self._busy_label.setVisible(bool(message and str(message).strip()))
@@ -1411,12 +1528,12 @@ class MainWindow(QtWidgets.QMainWindow):
         nodes = self.graph_nodes
         if not nodes:
             return []
-        node_set = set(nodes)
+        node_id_set = {id(n) for n in nodes}
         indeg = {id(n): 0 for n in nodes}
         outgoing = {id(n): [] for n in nodes}
         for rec in self.graph_edges:
             s, d = rec["src"], rec["dst"]
-            if s not in node_set or d not in node_set:
+            if id(s) not in node_id_set or id(d) not in node_id_set:
                 continue
             outgoing[id(s)].append(d)
             indeg[id(d)] += 1
@@ -1464,6 +1581,26 @@ class MainWindow(QtWidgets.QMainWindow):
         self._begin_busy("Connecting to hardware…")
         self._sync_connection_ui()
 
+        # Environment-variable escape hatch. Set LABSMITH_SYNC_CONNECT=1 to
+        # build the LabsmithBoard on the GUI thread instead of the worker
+        # thread. Use this if the Windows COM driver / uProcess_x64.pyd has
+        # thread-affinity issues and the default threaded connect crashes or
+        # hangs. The GUI will briefly freeze during connect but the board
+        # object stays on the same thread it's used from afterwards.
+        if os.environ.get("LABSMITH_SYNC_CONNECT", "").strip().lower() in ("1", "true", "yes"):
+            board = None
+            err = ""
+            try:
+                QtWidgets.QApplication.processEvents()  # paint busy UI once
+                board = LabsmithBoard(port)
+            except Exception as exc:
+                err = str(exc)
+            # Re-use the same completion path as the threaded variant so the
+            # UI behaviour is identical (busy clear / error dialog / device
+            # population).
+            self._on_connect_worker_finished(board, err)
+            return
+
         self._connect_thread = QtCore.QThread(self)
         self._connect_worker = ConnectWorker(port)
         self._connect_worker.moveToThread(self._connect_thread)
@@ -1485,7 +1622,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if board is not None:
             self._board = board
-            self._populate_device_names()
+            self._refresh_device_dropdowns()
             self._refresh_bus_modules_panel()
             self._save_last_com_pref()
         elif err:
@@ -1516,7 +1653,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.syringe_status_label.setText("—")
             self.manifold_status_label.setText("—")
             self.bus_text.clear()
-            self._graph_refresh_param_sidebar_from_board()
+            self._refresh_device_dropdowns()
             self._sync_connection_ui()
             self._update_status_bar()
 
@@ -1613,7 +1750,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 board = self._try_connect_port(port_num)
                 if board is not None:
                     self._board = board
-                    self._populate_device_names()
+                    self._refresh_device_dropdowns()
                     self._refresh_bus_modules_panel()
                     self._save_last_com_pref()
                     self._sync_connection_ui()
@@ -1634,30 +1771,18 @@ class MainWindow(QtWidgets.QMainWindow):
             self._end_busy()
 
     def _populate_device_names(self):
-        """Populate syringe and manifold combo boxes from connected board."""
+        """Populate Manual Control combos from LabsmithBoard.connected_devices()."""
         try:
             self.syringe_combo.clear()
             self.manifold_combo.clear()
-            if self._board.SPS01 is not None:
-                for dev in self._board.SPS01:
-                    if dev is not None:
-                        addr = getattr(dev, "address", None)
-                        label = (
-                            f"{dev.name} (Addr {addr})"
-                            if addr is not None and str(addr) != ""
-                            else str(dev.name)
-                        )
-                        self.syringe_combo.addItem(label, dev.name)
-            if self._board.C4VM is not None:
-                for dev in self._board.C4VM:
-                    if dev is not None:
-                        addr = getattr(dev, "address", None)
-                        label = (
-                            f"{dev.name} (Addr {addr})"
-                            if addr is not None and str(addr) != ""
-                            else str(dev.name)
-                        )
-                        self.manifold_combo.addItem(label, dev.name)
+            for dev in self._connected_device_entries():
+                name = str(dev.get("name", "")).strip()
+                if not name:
+                    continue
+                if dev.get("type") == "syringe":
+                    self.syringe_combo.addItem(name, name)
+                elif dev.get("type") == "manifold":
+                    self.manifold_combo.addItem(name, name)
         except Exception:
             pass
         self._on_syringe_selection_changed()
@@ -1932,6 +2057,8 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.critical(self, "Valve motion", str(e))
 
     def _refresh_bus_modules_panel(self):
+        self._refresh_device_table()
+        self._refresh_device_dropdowns()
         self.bus_text.clear()
         if self._board is None or not getattr(self._board, "isConnected", False):
             self.bus_text.setPlainText("Not connected.")
@@ -1959,6 +2086,44 @@ class MainWindow(QtWidgets.QMainWindow):
                 except Exception as e:
                     lines.append(f"  [{i}] (read error: {e})")
         self.bus_text.setPlainText("\n".join(lines))
+
+    def _refresh_device_table(self):
+        self.device_table.setRowCount(0)
+        if self._board is None or not getattr(self._board, "isConnected", False):
+            return
+        device_lists = [
+            ("SPS01", getattr(self._board, "SPS01", None)),
+            ("C4VM", getattr(self._board, "C4VM", None)),
+            ("C4AM", getattr(self._board, "C4AM", None)),
+            ("C4PM", getattr(self._board, "C4PM", None)),
+            ("CEP01", getattr(self._board, "CEP01", None)),
+        ]
+        for dev_type, arr in device_lists:
+            if arr is None:
+                continue
+            for dev in arr:
+                if dev is None:
+                    continue
+                row = self.device_table.rowCount()
+                self.device_table.insertRow(row)
+                name = str(getattr(dev, "name", "?"))
+                addr = getattr(dev, "add_syr", None)
+                if addr is None:
+                    addr = getattr(dev, "address", "?")
+                try:
+                    dev.UpdateStatus()
+                    online = getattr(dev, "FlagIsOnline", False)
+                except Exception:
+                    online = "error"
+                for col, text in enumerate([name, dev_type, str(addr), str(online)]):
+                    item = QtWidgets.QTableWidgetItem(text)
+                    item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+                    if col == 3:
+                        if online is True:
+                            item.setForeground(QtGui.QBrush(QtGui.QColor("#2ecc71")))
+                        elif online is False:
+                            item.setForeground(QtGui.QBrush(QtGui.QColor("#e74c3c")))
+                    self.device_table.setItem(row, col, item)
 
     def _on_stop_bus_extra_modules(self):
         if self._board is None:
@@ -2026,8 +2191,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
         btn_layout = QtWidgets.QHBoxLayout()
         self.remove_step_btn = QtWidgets.QPushButton("Remove step")
+        self.save_flow_btn = QtWidgets.QPushButton("Save flow")
+        self.load_flow_btn = QtWidgets.QPushButton("Load flow")
         self.run_flow_btn = QtWidgets.QPushButton("Run flow")
         btn_layout.addWidget(self.remove_step_btn)
+        btn_layout.addWidget(self.save_flow_btn)
+        btn_layout.addWidget(self.load_flow_btn)
         btn_layout.addStretch()
         btn_layout.addWidget(self.run_flow_btn)
         center_layout.addLayout(btn_layout)
@@ -2054,6 +2223,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.add_step_btn.clicked.connect(self._on_add_step)
         self.remove_step_btn.clicked.connect(self._on_remove_step)
         self.run_flow_btn.clicked.connect(self._on_run_flow)
+        self.save_flow_btn.clicked.connect(self._on_save_flow)
+        self.load_flow_btn.clicked.connect(self._on_load_flow)
         self.flow_table.selectionModel().selectionChanged.connect(self._on_flow_selection_changed)
         self.flow_table.cellDoubleClicked.connect(self._on_flow_table_double_clicked)
 
@@ -2176,15 +2347,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if t == "Move syringe":
             # Syringe name
-            syringe_combo = QtWidgets.QComboBox()
-            names = []
-            if self._board is not None and getattr(self._board, "SPS01", None) is not None:
-                for dev in self._board.SPS01:
-                    if dev is not None:
-                        names.append(str(dev.name))
-            syringe_combo.addItems(names)
-            if step.get("syringe") and step["syringe"] in names:
-                syringe_combo.setCurrentText(step["syringe"])
+            syringe_combo = self._build_device_combo("syringe", step.get("syringe", ""))
             syringe_combo.currentTextChanged.connect(
                 lambda text: self._update_move_step("syringe", text)
             )
@@ -2213,15 +2376,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.param_layout.addRow("Seconds:", sec_edit)
 
         elif t == "Switch valves":
-            manifold_combo = QtWidgets.QComboBox()
-            names = []
-            if self._board is not None and getattr(self._board, "C4VM", None) is not None:
-                for dev in self._board.C4VM:
-                    if dev is not None:
-                        names.append(str(dev.name))
-            manifold_combo.addItems(names)
-            if step.get("manifold") and step["manifold"] in names:
-                manifold_combo.setCurrentText(step["manifold"])
+            manifold_combo = self._build_device_combo("manifold", step.get("manifold", ""))
             manifold_combo.currentTextChanged.connect(
                 lambda text: self._update_switch_step("manifold", text)
             )
@@ -2299,7 +2454,8 @@ class MainWindow(QtWidgets.QMainWindow):
             vol = float(step.get("volume", 0.0))
             if not name:
                 raise ValueError("Syringe name is empty.")
-            self._board.Move(name, flow, vol)
+            resolved = self._resolve_runtime_device("syringe", name)
+            self._board.Move(resolved["name"], flow, vol)
         elif t == "Wait":
             sec = float(step.get("seconds", 0.0))
             if sec > 0:
@@ -2308,7 +2464,10 @@ class MainWindow(QtWidgets.QMainWindow):
             name = step.get("manifold", "")
             if not name:
                 raise ValueError("Manifold name is empty.")
-            idx_m = self._board.FindIndexM(name)
+            resolved = self._resolve_runtime_device("manifold", name)
+            idx_m = resolved.get("index")
+            if not isinstance(idx_m, int):
+                idx_m = self._board.FindIndexM(resolved["name"])
             dev = self._board.C4VM[idx_m]
             dev.SwitchValves(
                 int(step.get("v1", 0)),
@@ -2321,32 +2480,254 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             raise ValueError(f"Unknown step type: {t!r}")
 
-    def _on_run_flow(self):
+    def _device_candidates_text(self, kind: str) -> str:
+        names = self._device_names(kind)
+        return ", ".join(names) if names else "(none)"
+
+    def _resolve_runtime_device(self, kind: str, ref: str) -> dict:
+        resolved = resolve_device_ref(kind, ref, self._connected_device_entries())
+        if resolved is None:
+            raise ValueError(
+                f"{kind} {ref!r} could not be resolved. "
+                f"Candidates: {self._device_candidates_text(kind)}"
+            )
+        return resolved
+
+    def _validate_device_refs(self, items, label):
+        """Validate syringe/manifold references and report legacy fallback warnings."""
+        errors = []
+        warnings = []
+        for i, item in enumerate(items, start=1):
+            t = item.get("type")
+            tag = f"{label} {i} ({t})"
+            if t == "Move syringe":
+                kind = "syringe"
+                field = "syringe"
+            elif t == "Switch valves":
+                kind = "manifold"
+                field = "manifold"
+            else:
+                continue
+
+            ref = str(item.get(field, "") or "").strip()
+            if not ref:
+                errors.append(f"{tag}: {field} name is empty.")
+                continue
+            if self._board is None:
+                continue
+
+            resolved = resolve_device_ref(kind, ref, self._connected_device_entries())
+            if resolved is None:
+                legacy_hint = ""
+                legacy_re = LEGACY_SYRINGE_RE if kind == "syringe" else LEGACY_MANIFOLD_RE
+                m = legacy_re.match(ref)
+                if m:
+                    n = int(m.group(1))
+                    connected_count = sum(
+                        1 for d in self._connected_device_entries()
+                        if str(d.get("type", "")).lower() == kind
+                    )
+                    legacy_hint = (
+                        f" (legacy index {n} exceeds connected {kind} count "
+                        f"{connected_count}; reselect from the dropdown)"
+                    )
+                errors.append(
+                    f"{tag}: {kind} '{ref}' not in connected devices.{legacy_hint} "
+                    f"Candidates: {self._device_candidates_text(kind)}"
+                )
+                continue
+            if resolved.get("matched_via") == "legacy_index":
+                warnings.append(
+                    f"{tag}: {kind} '{ref}' matched by legacy_index to "
+                    f"'{resolved.get('name')}' (addr={resolved.get('addr')}); "
+                    f"reselect from the dropdown and save to remove compatibility mapping."
+                )
+        return errors, warnings
+
+    def _validate_steps_for_run(self, steps, label="Step"):
+        """Validate steps/nodes before execution. Returns (errors, warnings)."""
+        errors = []
+        warnings = []
         if self._board is None:
-            QtWidgets.QMessageBox.warning(self, "Not connected", "Please connect the board first.")
-            return
+            errors.append("Board is not connected.")
+        if not steps:
+            errors.append(f"No {label.lower()}s to run.")
+            return errors, warnings
+        ref_errors, ref_warnings = self._validate_device_refs(steps, label)
+        errors.extend(ref_errors)
+        warnings.extend(ref_warnings)
+        known_types = {"Move syringe", "Switch valves", "Wait", "Stop board"}
+        for i, step in enumerate(steps, start=1):
+            t = step.get("type")
+            tag = f"{label} {i} ({t})"
+            if t == "Move syringe":
+                fr = step.get("flowrate", 0)
+                if not _is_valid_number(fr) or fr <= 0:
+                    errors.append(f"{tag}: flowrate must be > 0 (got {fr!r}).")
+                vol = step.get("volume", 0)
+                if not _is_valid_number(vol) or vol <= 0:
+                    errors.append(f"{tag}: volume must be > 0 (got {vol!r}).")
+            elif t == "Switch valves":
+                for vk in ("v1", "v2", "v3", "v4"):
+                    v = step.get(vk, 0)
+                    # bool is an int subclass; reject it explicitly or `True in
+                    # (0, 1)` would pass and become `1` at runtime.
+                    if isinstance(v, bool) or not isinstance(v, (int, float)) or v not in (0, 1):
+                        errors.append(f"{tag}: {vk} must be 0 or 1 (got {v!r}).")
+            elif t == "Wait":
+                sec = step.get("seconds", 0)
+                if not _is_valid_number(sec) or sec <= 0:
+                    errors.append(f"{tag}: seconds must be > 0 (got {sec!r}).")
+            elif t == "Stop board":
+                pass
+            else:
+                errors.append(f"{tag}: unknown type {t!r} (expected one of {sorted(known_types)}).")
+        return errors, warnings
+
+    def _on_save_flow(self):
         if not self.flow_steps:
-            QtWidgets.QMessageBox.information(self, "No steps", "Please add at least one step.")
+            QtWidgets.QMessageBox.information(self, "Save flow", "No steps to save.")
             return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Save flow", "", "JSON files (*.json);;All files (*)"
+        )
+        if not path:
+            return
+        data = {"version": 1, "type": "flow_designer", "steps": list(self.flow_steps)}
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Save error", str(e))
+
+    def _on_load_flow(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Load flow", "", "JSON files (*.json);;All files (*)"
+        )
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Load error", f"Invalid JSON file:\n{e}")
+            return
+        if not isinstance(data, dict) or data.get("type") != "flow_designer":
+            QtWidgets.QMessageBox.warning(
+                self, "Load error", "This file is not a flow designer file."
+            )
+            return
+        # Version check. v1 is the only supported format today. A missing
+        # version field is tolerated (pre-versioned files) but warned. A
+        # version we don't understand is rejected rather than silently
+        # misinterpreted as v1.
+        warnings = []
+        version = data.get("version")
+        if version is None:
+            warnings.append("File has no 'version' field; assuming v1.")
+        elif not isinstance(version, int) or version != 1:
+            QtWidgets.QMessageBox.warning(
+                self, "Load error",
+                f"Unsupported flow file version {version!r}. "
+                f"This build only supports version 1."
+            )
+            return
+        if "steps" not in data:
+            QtWidgets.QMessageBox.warning(self, "Load error", 'File has no "steps" key.')
+            return
+        steps = data["steps"]
+        if not isinstance(steps, list):
+            QtWidgets.QMessageBox.warning(self, "Load error", "Invalid steps data.")
+            return
+        if len(steps) > MAX_FLOW_ITEMS:
+            warnings.append(
+                f"File has {len(steps)} steps; only the first "
+                f"{MAX_FLOW_ITEMS} will be loaded."
+            )
+            steps = steps[:MAX_FLOW_ITEMS]
+        _required = {
+            "Move syringe": ("syringe", "flowrate", "volume"),
+            "Wait": ("seconds",),
+            "Switch valves": ("manifold", "v1", "v2", "v3", "v4"),
+            "Stop board": (),
+        }
+        loaded = []
+        for i, s in enumerate(steps):
+            if not isinstance(s, dict) or s.get("type") not in _required:
+                warnings.append(f"Step {i + 1}: skipped (unknown type or invalid)")
+                continue
+            missing = [k for k in _required[s["type"]] if k not in s]
+            if missing:
+                warnings.append(f"Step {i + 1}: skipped (missing fields: {', '.join(missing)})")
+                continue
+            loaded.append(s)
+        self.flow_steps.clear()
+        self.flow_steps.extend(loaded)
+        self.flow_table.setRowCount(0)
+        for row in range(len(self.flow_steps)):
+            self.flow_table.insertRow(row)
+            self._refresh_flow_row(row)
+        self._clear_param_editor()
+        if warnings:
+            QtWidgets.QMessageBox.warning(self, "Load warnings", "\n".join(warnings))
+
+    def _on_run_flow(self):
+        errors, warnings = self._validate_steps_for_run(self.flow_steps, "Step")
+        if errors:
+            QtWidgets.QMessageBox.warning(
+                self, "Validation errors",
+                "Cannot run flow:\n\n" + "\n".join(errors),
+            )
+            return
+        if warnings:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Device mapping warnings",
+                "Flow will run with compatibility mapping:\n\n" + "\n".join(warnings),
+            )
 
         n = len(self.flow_steps)
+        for r in range(n):
+            self._set_flow_row_color(r, "transparent")
+        self._prepare_board_for_run()
         self._begin_busy("Running flow…")
         try:
             for idx, step in enumerate(self.flow_steps, start=1):
+                if self._run_cancelled():
+                    break
+                row = idx - 1
                 t = step.get("type")
                 self._set_busy_message(f"Flow {idx}/{n}: {t}…")
+                self._set_flow_row_color(row, "#00a8e8")
                 QtWidgets.QApplication.processEvents()
                 try:
                     self._execute_one_flow_step(step)
+                    if self._run_cancelled():
+                        # User pressed Stop mid-step — mark as cancelled rather
+                        # than green so the row color reflects reality.
+                        self._set_flow_row_color(row, "#e67e22")
+                        break
+                    self._set_flow_row_color(row, "#2ecc71")
                 except Exception as e:
+                    self._set_flow_row_color(row, "#e74c3c")
+                    QtWidgets.QApplication.processEvents()
                     QtWidgets.QMessageBox.critical(
                         self,
                         "Execution error",
                         f"Error executing step {idx} ({t}):\n{e}",
                     )
                     break
+                QtWidgets.QApplication.processEvents()
         finally:
             self._end_busy()
+            self._finalize_board_after_run()
+
+    def _set_flow_row_color(self, row, color):
+        brush = QtGui.QBrush(QtGui.QColor(color))
+        for col in range(self.flow_table.columnCount()):
+            item = self.flow_table.item(row, col)
+            if item is not None:
+                item.setBackground(brush)
 
     # ===== Flow graph (visual flowchart) =====
     def _init_flow_graph(self):
@@ -2423,9 +2804,13 @@ class MainWindow(QtWidgets.QMainWindow):
         ctrl_layout = QtWidgets.QHBoxLayout()
         self.graph_fit_btn = QtWidgets.QPushButton("Fit view")
         self.graph_fit_btn.setToolTip("Reset zoom and frame all nodes.")
+        self.graph_save_btn = QtWidgets.QPushButton("Save graph")
+        self.graph_load_btn = QtWidgets.QPushButton("Load graph")
         self.graph_run_btn = QtWidgets.QPushButton("Run graph")
         self.graph_run_btn.setObjectName("primaryButton")
         ctrl_layout.addWidget(self.graph_fit_btn)
+        ctrl_layout.addWidget(self.graph_save_btn)
+        ctrl_layout.addWidget(self.graph_load_btn)
         ctrl_layout.addStretch()
         ctrl_layout.addWidget(self.graph_run_btn)
         center_layout.addLayout(ctrl_layout)
@@ -2467,6 +2852,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.graph_clear_btn.clicked.connect(self._on_graph_clear)
         self.graph_run_btn.clicked.connect(self._on_graph_run)
         self.graph_fit_btn.clicked.connect(self._graph_fit_view)
+        self.graph_save_btn.clicked.connect(self._on_save_graph)
+        self.graph_load_btn.clicked.connect(self._on_load_graph)
         self.graph_view.connectionRequested.connect(self._on_graph_connection_requested)
         self.graph_scene.selectionChanged.connect(self._on_graph_scene_selection_changed)
 
@@ -2539,19 +2926,7 @@ class MainWindow(QtWidgets.QMainWindow):
         t = step.get("type")
 
         if t == "Move syringe":
-            syringe_combo = QtWidgets.QComboBox()
-            syringe_combo.setEditable(True)
-            names = []
-            if self._board is not None and getattr(self._board, "SPS01", None) is not None:
-                for dev in self._board.SPS01:
-                    if dev is not None:
-                        names.append(str(dev.name))
-            syringe_combo.addItems(names)
-            cur = step.get("syringe") or ""
-            if cur in names:
-                syringe_combo.setCurrentText(cur)
-            elif cur:
-                syringe_combo.setEditText(cur)
+            syringe_combo = self._build_device_combo("syringe", step.get("syringe", ""))
             syringe_combo.currentTextChanged.connect(
                 lambda text, s=step: self._graph_sidebar_update_move(s, "syringe", text)
             )
@@ -2580,19 +2955,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.graph_param_layout.addRow("Seconds:", sec_edit)
 
         elif t == "Switch valves":
-            manifold_combo = QtWidgets.QComboBox()
-            manifold_combo.setEditable(True)
-            names = []
-            if self._board is not None and getattr(self._board, "C4VM", None) is not None:
-                for dev in self._board.C4VM:
-                    if dev is not None:
-                        names.append(str(dev.name))
-            manifold_combo.addItems(names)
-            cur = step.get("manifold") or ""
-            if cur in names:
-                manifold_combo.setCurrentText(cur)
-            elif cur:
-                manifold_combo.setEditText(cur)
+            manifold_combo = self._build_device_combo("manifold", step.get("manifold", ""))
             manifold_combo.currentTextChanged.connect(
                 lambda text, s=step: self._graph_sidebar_update_switch(s, "manifold", text)
             )
@@ -2625,7 +2988,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _graph_refresh_param_sidebar_from_board(self) -> None:
         """Repopulate device combos after connect/disconnect."""
-        if self._graph_sidebar_step is None:
+        # Guard against early refresh calls that arrive before __init__ finished
+        # wiring up _graph_sidebar_step (e.g. if a ConnectWorker callback fires
+        # earlier in a future refactor).
+        if getattr(self, "_graph_sidebar_step", None) is None:
             return
         if self._graph_sidebar_step not in self.graph_nodes:
             self._graph_clear_param_sidebar()
@@ -2844,48 +3210,210 @@ class MainWindow(QtWidgets.QMainWindow):
         self._graph_clear_param_sidebar()
         self._graph_refresh_nodes_bar()
 
-    def _on_graph_run(self):
-        if self._board is None:
-            QtWidgets.QMessageBox.warning(
-                self, "Not connected", "Please connect the board first."
-            )
-            return
+    def _on_save_graph(self):
         if not self.graph_nodes:
-            QtWidgets.QMessageBox.information(
-                self, "No nodes", "Please add at least one node."
-            )
+            QtWidgets.QMessageBox.information(self, "Save graph", "No nodes to save.")
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Save graph", "", "JSON files (*.json);;All files (*)"
+        )
+        if not path:
+            return
+        _data_keys = {"type", "syringe", "flowrate", "volume", "seconds",
+                       "manifold", "v1", "v2", "v3", "v4"}
+        node_id_map = {}
+        nodes_out = []
+        for i, n in enumerate(self.graph_nodes):
+            nid = f"n{i}"
+            node_id_map[id(n)] = nid
+            entry = {"id": nid}
+            for k, v in n.items():
+                if k in _data_keys:
+                    entry[k] = v
+            item = n.get("item")
+            if item is not None:
+                entry["x"] = item.pos().x()
+                entry["y"] = item.pos().y()
+            nodes_out.append(entry)
+        edges_out = []
+        for e in self.graph_edges:
+            src_id = node_id_map.get(id(e["src"]))
+            dst_id = node_id_map.get(id(e["dst"]))
+            if src_id is not None and dst_id is not None:
+                edges_out.append({"src_id": src_id, "dst_id": dst_id})
+        data = {"version": 1, "type": "flow_graph",
+                "nodes": nodes_out, "edges": edges_out}
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Save error", str(e))
+
+    def _on_load_graph(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Load graph", "", "JSON files (*.json);;All files (*)"
+        )
+        if not path:
             return
         try:
-            self._validate_graph_for_run()
-            exec_order = self._get_graph_execution_order()
-        except ValueError as e:
-            QtWidgets.QMessageBox.warning(self, "Graph error", str(e))
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Load error", f"Invalid JSON file:\n{e}")
             return
+        if not isinstance(data, dict) or data.get("type") != "flow_graph":
+            QtWidgets.QMessageBox.warning(
+                self, "Load error", "This file is not a flow graph file."
+            )
+            return
+        warnings = []
+        version = data.get("version")
+        if version is None:
+            warnings.append("File has no 'version' field; assuming v1.")
+        elif not isinstance(version, int) or version != 1:
+            QtWidgets.QMessageBox.warning(
+                self, "Load error",
+                f"Unsupported graph file version {version!r}. "
+                f"This build only supports version 1."
+            )
+            return
+        if "nodes" not in data:
+            QtWidgets.QMessageBox.warning(self, "Load error", 'File has no "nodes" key.')
+            return
+        nodes_data = data["nodes"]
+        edges_data = data.get("edges", [])
+        if not isinstance(nodes_data, list):
+            QtWidgets.QMessageBox.warning(self, "Load error", "Invalid nodes data.")
+            return
+        if len(nodes_data) > MAX_FLOW_ITEMS:
+            warnings.append(
+                f"File has {len(nodes_data)} nodes; only the first "
+                f"{MAX_FLOW_ITEMS} will be loaded."
+            )
+            nodes_data = nodes_data[:MAX_FLOW_ITEMS]
+        _required = {
+            "Move syringe": ("syringe", "flowrate", "volume"),
+            "Wait": ("seconds",),
+            "Switch valves": ("manifold", "v1", "v2", "v3", "v4"),
+            "Stop board": (),
+        }
+        _data_keys = {"syringe", "flowrate", "volume", "seconds",
+                       "manifold", "v1", "v2", "v3", "v4"}
+        self._on_graph_clear()
+        id_to_node = {}
+        for i, nd in enumerate(nodes_data):
+            if not isinstance(nd, dict):
+                warnings.append(f"Node {i}: skipped (not a dict)")
+                continue
+            ntype = nd.get("type")
+            if ntype not in _required:
+                warnings.append(f"Node {i}: skipped (unknown type {ntype!r})")
+                continue
+            missing = [k for k in _required[ntype] if k not in nd]
+            if missing:
+                warnings.append(f"Node {i}: skipped (missing fields: {', '.join(missing)})")
+                continue
+            nid = nd.get("id", f"n{i}")
+            if nid in id_to_node:
+                # Duplicate ids would let the later node overwrite the earlier
+                # one in id_to_node, silently re-routing edges. Skip and warn.
+                warnings.append(
+                    f"Node {i}: skipped (duplicate id {nid!r}; "
+                    f"keep the first occurrence)"
+                )
+                continue
+            self._graph_add_node_from_type(ntype)
+            node = self.graph_nodes[-1]
+            for k in _data_keys:
+                if k in nd:
+                    node[k] = nd[k]
+            x = nd.get("x", 0)
+            y = nd.get("y", i * 70)
+            item = node.get("item")
+            if item is not None:
+                item.setPos(x, y)
+            id_to_node[nid] = node
+        if isinstance(edges_data, list):
+            for j, ed in enumerate(edges_data):
+                if not isinstance(ed, dict):
+                    warnings.append(f"Edge {j}: skipped (not a dict)")
+                    continue
+                src = id_to_node.get(ed.get("src_id"))
+                dst = id_to_node.get(ed.get("dst_id"))
+                if src is None or dst is None:
+                    warnings.append(f"Edge {j}: skipped (references unknown node)")
+                    continue
+                self._graph_create_edge(src, dst)
+        self._schedule_graph_edge_positions()
+        if warnings:
+            QtWidgets.QMessageBox.warning(self, "Load warnings", "\n".join(warnings))
+
+    def _on_graph_run(self):
+        errors, warnings = self._validate_steps_for_run(self.graph_nodes, "Node")
+        if self.graph_nodes:
+            try:
+                self._validate_graph_for_run()
+            except ValueError as e:
+                errors.append(f"Graph structure: {e}")
+        if errors:
+            QtWidgets.QMessageBox.warning(
+                self, "Validation errors",
+                "Cannot run graph:\n\n" + "\n".join(errors),
+            )
+            return
+        if warnings:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Device mapping warnings",
+                "Graph will run with compatibility mapping:\n\n" + "\n".join(warnings),
+            )
+        exec_order = self._get_graph_execution_order()
 
         n = len(exec_order)
+        for node in self.graph_nodes:
+            it = node.get("item")
+            if it is not None:
+                it.setPen(QtGui.QPen(ACCENT, 2))
+        self._prepare_board_for_run()
         self._begin_busy("Running graph…")
         try:
             for idx, step in enumerate(exec_order, start=1):
+                if self._run_cancelled():
+                    break
                 t = step.get("type")
+                item = step.get("item")
                 self._set_busy_message(f"Graph {idx}/{n}: {t}…")
+                if item is not None:
+                    item.setPen(QtGui.QPen(QtGui.QColor("#00a8e8"), 2))
                 QtWidgets.QApplication.processEvents()
                 try:
                     self._execute_one_flow_step(step)
+                    if self._run_cancelled():
+                        if item is not None:
+                            item.setPen(QtGui.QPen(QtGui.QColor("#e67e22"), 2))
+                        break
+                    if item is not None:
+                        item.setPen(QtGui.QPen(QtGui.QColor("#2ecc71"), 2))
                 except Exception as e:
+                    if item is not None:
+                        item.setPen(QtGui.QPen(QtGui.QColor("#e74c3c"), 2))
+                    QtWidgets.QApplication.processEvents()
                     QtWidgets.QMessageBox.critical(
                         self,
                         "Execution error",
                         f"Error executing node {idx} ({t}):\n{e}",
                     )
                     break
+                QtWidgets.QApplication.processEvents()
         finally:
             self._end_busy()
+            self._finalize_board_after_run()
 
 
 class StepParamDialog(QtWidgets.QDialog):
     """Dialog to edit parameters of a flow step / graph node."""
 
-    def __init__(self, parent, board: LabsmithBoard | None, step: dict):
+    def __init__(self, parent, board: Optional[LabsmithBoard], step: dict):
         super().__init__(parent)
         self.setWindowTitle("Edit node parameters")
         self.setWindowIcon(build_app_icon())
@@ -2901,11 +3429,7 @@ class StepParamDialog(QtWidgets.QDialog):
             le = self.syringe_combo.lineEdit()
             if le is not None:
                 le.setPlaceholderText("Device name (type or pick after connect)")
-            names = []
-            if self._board is not None and getattr(self._board, "SPS01", None) is not None:
-                for dev in self._board.SPS01:
-                    if dev is not None:
-                        names.append(str(dev.name))
+            names = _device_names_from_board(self._board, "syringe")
             self.syringe_combo.addItems(names)
             cur = (step.get("syringe") or "").strip()
             if cur:
@@ -2931,11 +3455,7 @@ class StepParamDialog(QtWidgets.QDialog):
             lem = self.manifold_combo.lineEdit()
             if lem is not None:
                 lem.setPlaceholderText("Manifold name (type or pick after connect)")
-            names = []
-            if self._board is not None and getattr(self._board, "C4VM", None) is not None:
-                for dev in self._board.C4VM:
-                    if dev is not None:
-                        names.append(str(dev.name))
+            names = _device_names_from_board(self._board, "manifold")
             self.manifold_combo.addItems(names)
             curm = (step.get("manifold") or "").strip()
             if curm:
@@ -3013,4 +3533,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
