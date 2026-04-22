@@ -137,9 +137,47 @@ class CSyringe:
         self.Flowrate = flowrate
         rv = self.device.CmdMoveToVolume(volume)
         if rv is False:
-            raise RuntimeError(
-                f"Syringe ({self._move_context(flowrate, volume)}): CmdMoveToVolume({volume}) returned False."
-            )
+            # Some firmware builds occasionally return False transiently.
+            # Retry a few times with short delays before deciding failure.
+            for delay_s in (0.03, 0.08, 0.15):
+                try:
+                    time.sleep(delay_s)
+                    rv_retry = self.device.CmdMoveToVolume(volume)
+                    if rv_retry is not False:
+                        rv = rv_retry
+                        break
+                except Exception:
+                    pass
+        if rv is False:
+            # If retry still reports False, poll status for a short window:
+            # motion may start asynchronously even when the API returns False.
+            moving_now = False
+            target_reached = False
+            current_volume = getattr(self, "volume_ul", None)
+            for _ in range(6):
+                try:
+                    time.sleep(0.06)
+                    self.UpdateStatus()
+                except Exception:
+                    pass
+                current_volume = getattr(self, "volume_ul", None)
+                target_reached = isinstance(current_volume, (int, float)) and abs(
+                    float(current_volume) - float(volume)
+                ) <= 0.5
+                moving_now = bool(
+                    getattr(self, "FlagIsMoving", False)
+                    or getattr(self, "FlagIsMovingIn", False)
+                    or getattr(self, "FlagIsMovingOut", False)
+                )
+                if moving_now or target_reached:
+                    break
+            if not moving_now and not target_reached:
+                raise RuntimeError(
+                    f"Syringe ({self._move_context(flowrate, volume)}): "
+                    f"CmdMoveToVolume({volume}) returned False "
+                    f"(current_volume={current_volume!r}, moving={moving_now}, target_reached={target_reached})."
+                )
+            # Treat as accepted/no-op and continue.
         self.FlagReady = False
         self.displaymovement()
         if self.FlagIsMoving == True:

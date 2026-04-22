@@ -2191,10 +2191,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
         btn_layout = QtWidgets.QHBoxLayout()
         self.remove_step_btn = QtWidgets.QPushButton("Remove step")
+        self.autodetect_flow_modules_btn = QtWidgets.QPushButton("Auto-detect modules")
+        self.run_selected_step_btn = QtWidgets.QPushButton("Run selected step")
         self.save_flow_btn = QtWidgets.QPushButton("Save flow")
         self.load_flow_btn = QtWidgets.QPushButton("Load flow")
         self.run_flow_btn = QtWidgets.QPushButton("Run flow")
         btn_layout.addWidget(self.remove_step_btn)
+        btn_layout.addWidget(self.autodetect_flow_modules_btn)
+        btn_layout.addWidget(self.run_selected_step_btn)
         btn_layout.addWidget(self.save_flow_btn)
         btn_layout.addWidget(self.load_flow_btn)
         btn_layout.addStretch()
@@ -2222,6 +2226,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # Connections
         self.add_step_btn.clicked.connect(self._on_add_step)
         self.remove_step_btn.clicked.connect(self._on_remove_step)
+        self.autodetect_flow_modules_btn.clicked.connect(self._on_flow_autodetect_modules)
+        self.run_selected_step_btn.clicked.connect(self._on_run_selected_flow_step)
         self.run_flow_btn.clicked.connect(self._on_run_flow)
         self.save_flow_btn.clicked.connect(self._on_save_flow)
         self.load_flow_btn.clicked.connect(self._on_load_flow)
@@ -2493,6 +2499,37 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         return resolved
 
+    def _normalize_device_refs_for_run(self, items, label):
+        """Convert legacy/address refs to current connected names in-place."""
+        updates = []
+        if self._board is None:
+            return updates
+        for i, item in enumerate(items, start=1):
+            t = item.get("type")
+            if t == "Move syringe":
+                kind, field = "syringe", "syringe"
+            elif t == "Switch valves":
+                kind, field = "manifold", "manifold"
+            else:
+                continue
+            ref = str(item.get(field, "") or "").strip()
+            if not ref:
+                continue
+            resolved = resolve_device_ref(kind, ref, self._connected_device_entries())
+            if resolved is None:
+                continue
+            resolved_name = str(resolved.get("name", "") or "").strip()
+            if not resolved_name or resolved_name == ref:
+                continue
+            matched_via = str(resolved.get("matched_via", "") or "")
+            if matched_via not in ("legacy_index", "addr"):
+                continue
+            item[field] = resolved_name
+            updates.append(
+                f"{label} {i} ({t}): {kind} '{ref}' -> '{resolved_name}'"
+            )
+        return updates
+
     def _validate_device_refs(self, items, label):
         """Validate syringe/manifold references and report legacy fallback warnings."""
         errors = []
@@ -2672,6 +2709,10 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "Load warnings", "\n".join(warnings))
 
     def _on_run_flow(self):
+        migrated = self._normalize_device_refs_for_run(self.flow_steps, "Step")
+        if migrated:
+            for row in range(len(self.flow_steps)):
+                self._refresh_flow_row(row)
         errors, warnings = self._validate_steps_for_run(self.flow_steps, "Step")
         if errors:
             QtWidgets.QMessageBox.warning(
@@ -2679,11 +2720,23 @@ class MainWindow(QtWidgets.QMainWindow):
                 "Cannot run flow:\n\n" + "\n".join(errors),
             )
             return
-        if warnings:
+        if warnings or migrated:
+            details = []
+            if migrated:
+                details.extend(
+                    ["Converted legacy/device-address references to current names:"]
+                    + migrated
+                )
+            if warnings:
+                if details:
+                    details.append("")
+                details.extend(
+                    ["Flow will run with compatibility mapping:"] + warnings
+                )
             QtWidgets.QMessageBox.warning(
                 self,
                 "Device mapping warnings",
-                "Flow will run with compatibility mapping:\n\n" + "\n".join(warnings),
+                "\n".join(details),
             )
 
         n = len(self.flow_steps)
@@ -2718,6 +2771,181 @@ class MainWindow(QtWidgets.QMainWindow):
                     )
                     break
                 QtWidgets.QApplication.processEvents()
+        finally:
+            self._end_busy()
+            self._finalize_board_after_run()
+
+    def _autofill_flow_device_refs(self):
+        """Fill/normalize Flow Designer device references from connected modules.
+
+        Returns list[str] describing changes applied.
+        """
+        updates = []
+        entries = self._connected_device_entries()
+        syringes = [
+            str(d.get("name", "")).strip()
+            for d in entries
+            if str(d.get("type", "")).lower() == "syringe" and str(d.get("name", "")).strip()
+        ]
+        manifolds = [
+            str(d.get("name", "")).strip()
+            for d in entries
+            if str(d.get("type", "")).lower() == "manifold" and str(d.get("name", "")).strip()
+        ]
+        fallback = {
+            "Move syringe": ("syringe", syringes[0] if syringes else ""),
+            "Switch valves": ("manifold", manifolds[0] if manifolds else ""),
+        }
+
+        # First pass: convert legacy/address refs to current names when resolvable.
+        updates.extend(self._normalize_device_refs_for_run(self.flow_steps, "Step"))
+
+        # Second pass: if reference is empty/unresolvable, auto-fill with first
+        # connected module of that kind to make quick testing easier.
+        for i, step in enumerate(self.flow_steps, start=1):
+            t = step.get("type")
+            if t not in fallback:
+                continue
+            field, default_name = fallback[t]
+            if not default_name:
+                continue
+            ref = str(step.get(field, "") or "").strip()
+            resolved = resolve_device_ref(
+                "syringe" if field == "syringe" else "manifold",
+                ref,
+                entries,
+            ) if ref else None
+            if ref and resolved is not None:
+                continue
+            old = ref or "(empty)"
+            step[field] = default_name
+            updates.append(f"Step {i} ({t}): {field} '{old}' -> '{default_name}'")
+        return updates
+
+    def _on_flow_autodetect_modules(self):
+        if self._board is None:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Auto-detect modules",
+                "Connect the board first, then auto-detect modules for flow steps.",
+            )
+            return
+        self._refresh_device_dropdowns()
+        updates = self._autofill_flow_device_refs()
+        for row in range(len(self.flow_steps)):
+            self._refresh_flow_row(row)
+        cur = self.flow_table.currentRow()
+        if 0 <= cur < len(self.flow_steps):
+            self._build_param_editor_for_step(self.flow_steps[cur])
+        if updates:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Auto-detect modules",
+                "Updated flow step module references:\n\n" + "\n".join(updates),
+            )
+        else:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Auto-detect modules",
+                "No changes needed. Flow steps already match connected modules.",
+            )
+
+    def _on_run_selected_flow_step(self):
+        row = self.flow_table.currentRow()
+        if row < 0 or row >= len(self.flow_steps):
+            QtWidgets.QMessageBox.information(
+                self,
+                "Run selected step",
+                "Select one flow step in the table first.",
+            )
+            return
+        step = self.flow_steps[row]
+
+        migrated = self._normalize_device_refs_for_run([step], "Selected step")
+        autofilled = []
+        if self._board is not None:
+            entries = self._connected_device_entries()
+            t = step.get("type")
+            if t == "Move syringe":
+                names = [
+                    str(d.get("name", "")).strip()
+                    for d in entries
+                    if str(d.get("type", "")).lower() == "syringe" and str(d.get("name", "")).strip()
+                ]
+                if names:
+                    ref = str(step.get("syringe", "") or "").strip()
+                    resolved = resolve_device_ref("syringe", ref, entries) if ref else None
+                    if not ref or resolved is None:
+                        old = ref or "(empty)"
+                        step["syringe"] = names[0]
+                        autofilled.append(
+                            f"Step {row + 1} ({t}): syringe '{old}' -> '{names[0]}'"
+                        )
+            elif t == "Switch valves":
+                names = [
+                    str(d.get("name", "")).strip()
+                    for d in entries
+                    if str(d.get("type", "")).lower() == "manifold" and str(d.get("name", "")).strip()
+                ]
+                if names:
+                    ref = str(step.get("manifold", "") or "").strip()
+                    resolved = resolve_device_ref("manifold", ref, entries) if ref else None
+                    if not ref or resolved is None:
+                        old = ref or "(empty)"
+                        step["manifold"] = names[0]
+                        autofilled.append(
+                            f"Step {row + 1} ({t}): manifold '{old}' -> '{names[0]}'"
+                        )
+        self._refresh_flow_row(row)
+        self._build_param_editor_for_step(step)
+
+        errors, warnings = self._validate_steps_for_run([step], "Step")
+        if errors:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Validation errors",
+                "Cannot run selected step:\n\n" + "\n".join(errors),
+            )
+            return
+        if warnings or migrated or autofilled:
+            details = []
+            if migrated:
+                details.extend(["Converted module references:"] + migrated)
+            if autofilled:
+                if details:
+                    details.append("")
+                details.extend(["Auto-filled module references:"] + autofilled)
+            if warnings:
+                if details:
+                    details.append("")
+                details.extend(["Compatibility mapping warnings:"] + warnings)
+            QtWidgets.QMessageBox.information(
+                self,
+                "Run selected step",
+                "\n".join(details),
+            )
+
+        self._set_flow_row_color(row, "transparent")
+        self._prepare_board_for_run()
+        self._begin_busy(f"Running step {row + 1}…")
+        try:
+            t = step.get("type")
+            self._set_busy_message(f"Step {row + 1}: {t}…")
+            self._set_flow_row_color(row, "#00a8e8")
+            QtWidgets.QApplication.processEvents()
+            self._execute_one_flow_step(step)
+            if self._run_cancelled():
+                self._set_flow_row_color(row, "#e67e22")
+            else:
+                self._set_flow_row_color(row, "#2ecc71")
+        except Exception as e:
+            self._set_flow_row_color(row, "#e74c3c")
+            QtWidgets.QApplication.processEvents()
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Execution error",
+                f"Error executing selected step {row + 1} ({step.get('type')}):\n{e}",
+            )
         finally:
             self._end_busy()
             self._finalize_board_after_run()
@@ -3349,6 +3577,11 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "Load warnings", "\n".join(warnings))
 
     def _on_graph_run(self):
+        migrated = self._normalize_device_refs_for_run(self.graph_nodes, "Node")
+        if migrated:
+            for node in self.graph_nodes:
+                self._graph_refresh_node_canvas_label(node)
+            self._graph_refresh_param_sidebar_from_board()
         errors, warnings = self._validate_steps_for_run(self.graph_nodes, "Node")
         if self.graph_nodes:
             try:
@@ -3361,11 +3594,23 @@ class MainWindow(QtWidgets.QMainWindow):
                 "Cannot run graph:\n\n" + "\n".join(errors),
             )
             return
-        if warnings:
+        if warnings or migrated:
+            details = []
+            if migrated:
+                details.extend(
+                    ["Converted legacy/device-address references to current names:"]
+                    + migrated
+                )
+            if warnings:
+                if details:
+                    details.append("")
+                details.extend(
+                    ["Graph will run with compatibility mapping:"] + warnings
+                )
             QtWidgets.QMessageBox.warning(
                 self,
                 "Device mapping warnings",
-                "Graph will run with compatibility mapping:\n\n" + "\n".join(warnings),
+                "\n".join(details),
             )
         exec_order = self._get_graph_execution_order()
 

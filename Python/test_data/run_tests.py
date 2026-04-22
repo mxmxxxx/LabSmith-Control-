@@ -39,7 +39,7 @@ print("\n=== T1: Bug Fix Verification ===")
 # other paths had NameError/TypeError/missing-parentheses bugs. We now assert
 # the post-rewrite contract instead of the old elif layout.
 board_path = os.path.join(TEST_DIR, "..", "LabsmithBoard.py")
-with open(board_path, "r") as f:
+with open(board_path, "r", encoding="utf-8") as f:
     board_src = f.read()
 check(
     "T1.1 MoveWait uses unified pumps-list dispatch",
@@ -89,14 +89,14 @@ check(
 )
 
 # T1.2 strftime
-with open(board_path, "r") as f:
+with open(board_path, "r", encoding="utf-8") as f:
     content = f.read()
 check("T1.2 no strftime('#X')", "strftime('#X')" not in content)
 check("T1.2 has strftime('%X')", "strftime('%X')" in content)
 
 # T1.3 set(nodes)
 gui_path = os.path.join(TEST_DIR, "..", "labsmith_gui.py")
-with open(gui_path, "r") as f:
+with open(gui_path, "r", encoding="utf-8") as f:
     gui_content = f.read()
 check("T1.3 no set(nodes)", "set(nodes)" not in gui_content)
 check("T1.3 has node_id_set", "node_id_set" in gui_content)
@@ -106,14 +106,14 @@ check("T1.3 has node_id_set", "node_id_set" in gui_content)
 print("\n=== T2: Save/Load Round-Trip ===")
 
 # Flow Designer round-trip
-with open(os.path.join(TEST_DIR, "sample_flow.json"), "r") as f:
+with open(os.path.join(TEST_DIR, "sample_flow.json"), "r", encoding="utf-8") as f:
     flow_data = json.load(f)
 
 with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tmp:
     json.dump(flow_data, tmp, indent=2)
     tmp_path = tmp.name
 
-with open(tmp_path, "r") as f:
+with open(tmp_path, "r", encoding="utf-8") as f:
     reloaded = json.load(f)
 os.unlink(tmp_path)
 
@@ -123,14 +123,14 @@ check("T2.1 flow round-trip steps match", reloaded["steps"] == flow_data["steps"
 check("T2.1 flow step count", len(reloaded["steps"]) == 7)
 
 # Flow Graph round-trip
-with open(os.path.join(TEST_DIR, "sample_graph.json"), "r") as f:
+with open(os.path.join(TEST_DIR, "sample_graph.json"), "r", encoding="utf-8") as f:
     graph_data = json.load(f)
 
 with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tmp:
     json.dump(graph_data, tmp, indent=2)
     tmp_path = tmp.name
 
-with open(tmp_path, "r") as f:
+with open(tmp_path, "r", encoding="utf-8") as f:
     reloaded = json.load(f)
 os.unlink(tmp_path)
 
@@ -144,7 +144,7 @@ check("T2.2 graph uses node IDs not indices",
 print("\n=== T2: Error Handling ===")
 
 # Missing fields should be skipped
-with open(os.path.join(TEST_DIR, "bad_flow_missing_fields.json"), "r") as f:
+with open(os.path.join(TEST_DIR, "bad_flow_missing_fields.json"), "r", encoding="utf-8") as f:
     bad_data = json.load(f)
 
 _required = {
@@ -171,12 +171,12 @@ check("T2 bad flow: 3 steps skipped", len(skipped) == 3,
       f"got {len(skipped)}: {skipped}")
 
 # Missing "steps" key
-with open(os.path.join(TEST_DIR, "bad_flow_no_steps_key.json"), "r") as f:
+with open(os.path.join(TEST_DIR, "bad_flow_no_steps_key.json"), "r", encoding="utf-8") as f:
     no_steps = json.load(f)
 check("T2 no-steps-key detected", "steps" not in no_steps)
 
 # Broken edge reference
-with open(os.path.join(TEST_DIR, "bad_graph_broken_edge.json"), "r") as f:
+with open(os.path.join(TEST_DIR, "bad_graph_broken_edge.json"), "r", encoding="utf-8") as f:
     bad_graph = json.load(f)
 id_set = {n["id"] for n in bad_graph["nodes"]}
 broken = [e for e in bad_graph["edges"]
@@ -357,9 +357,9 @@ check("T7.4 GUI checks run_cancelled in loops",
 # T7.5 CSyringe/CManifold raise on failure
 syringe_path = os.path.join(TEST_DIR, "..", "CSyringe.py")
 manifold_path = os.path.join(TEST_DIR, "..", "CManifold.py")
-with open(syringe_path, "r") as f:
+with open(syringe_path, "r", encoding="utf-8") as f:
     syringe_src = f.read()
-with open(manifold_path, "r") as f:
+with open(manifold_path, "r", encoding="utf-8") as f:
     manifold_src = f.read()
 check("T7.5 CSyringe.MoveTo raises on offline",
       "is offline" in syringe_src and "raise RuntimeError" in syringe_src)
