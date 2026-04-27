@@ -1,0 +1,2 @@
+# Optional: only for building LabSmithControl.exe
+pyinstaller>=6.0

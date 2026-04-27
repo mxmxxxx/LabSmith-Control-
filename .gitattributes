@@ -1,0 +1,3 @@
+# Normalize line endings; keep Markdown as text for GitHub rendering
+* text=auto
+*.md text eol=lf

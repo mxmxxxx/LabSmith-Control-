@@ -1,0 +1,11 @@
+# LabSmith Control — dependencies installable with pip.
+#
+# Not on PyPI: the LabSmith driver `uProcess_x64` (Python/uProcess_x64/uProcess_x64.pyd)
+# must stay on PYTHONPATH / next to your scripts as in this repo layout.
+#
+# Install (from repo root, venv activated):
+#   pip install -r requirements.txt
+
+numpy>=1.19.0
+PyQt6>=6.4.0
+pyserial>=3.5

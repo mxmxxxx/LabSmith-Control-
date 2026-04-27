@@ -1,0 +1,22 @@
+# Local Python environments (never commit)
+venv/
+.venv/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# Local scratch flow JSON (do not commit)
+Python/1.json
+Python/111.json
+
+# Auto-generated session reports
+morning-report/
+
+# Editor / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

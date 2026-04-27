@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "type": "flow_designer",
+  "steps": [
+    {"type": "Move syringe", "syringe": "SPS01_1", "flowrate": 120.0, "volume": 25.0},
+    {"type": "Wait", "seconds": 1.0},
+    {"type": "Switch valves", "manifold": "C4VM_10", "v1": 1, "v2": 0, "v3": 1, "v4": 0},
+    {"type": "Move syringe", "syringe": "SPS01_2", "flowrate": 80.0, "volume": 50.0},
+    {"type": "Wait", "seconds": 2.0},
+    {"type": "Switch valves", "manifold": "C4VM_10", "v1": 0, "v2": 1, "v3": 0, "v4": 1},
+    {"type": "Stop board"}
+  ]
+}

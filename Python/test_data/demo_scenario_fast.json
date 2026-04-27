@@ -1,0 +1,52 @@
+{
+  "version": 1,
+  "type": "flow_designer",
+  "_comment": "Mock-driver demo. Wait steps shortened for a ~30s recording. Device names use legacy SPS01_/C4VM_ literals so Phase 1.5 fallback is exercised.",
+  "steps": [
+    {
+      "type": "Switch valves",
+      "manifold": "C4VM_10",
+      "v1": 1,
+      "v2": 0,
+      "v3": 0,
+      "v4": 0
+    },
+    {
+      "type": "Move syringe",
+      "syringe": "SPS01_1",
+      "flowrate": 200.0,
+      "volume": 50.0
+    },
+    {
+      "type": "Wait",
+      "seconds": 1.0
+    },
+    {
+      "type": "Move syringe",
+      "syringe": "SPS01_2",
+      "flowrate": 200.0,
+      "volume": 50.0
+    },
+    {
+      "type": "Wait",
+      "seconds": 2.0
+    },
+    {
+      "type": "Switch valves",
+      "manifold": "C4VM_10",
+      "v1": 0,
+      "v2": 1,
+      "v3": 0,
+      "v4": 0
+    },
+    {
+      "type": "Move syringe",
+      "syringe": "SPS01_1",
+      "flowrate": 400.0,
+      "volume": 100.0
+    },
+    {
+      "type": "Stop board"
+    }
+  ]
+}

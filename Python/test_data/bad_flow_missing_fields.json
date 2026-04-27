@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "type": "flow_designer",
+  "steps": [
+    {"type": "Move syringe", "syringe": "SPS01_1", "flowrate": 100.0, "volume": 25.0},
+    {"type": "Move syringe", "syringe": "SPS01_1"},
+    {"type": "Wait"},
+    {"type": "UNKNOWN_TYPE"},
+    {"type": "Switch valves", "manifold": "C4VM_1", "v1": 1, "v2": 0, "v3": 0, "v4": 0},
+    {"type": "Stop board"}
+  ]
+}
