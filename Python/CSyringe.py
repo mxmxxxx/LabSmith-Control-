@@ -128,6 +128,19 @@ class CSyringe:
                 f"Syringe {self.name} is busy (FlagIsDone=False) — wait for the "
                 f"previous move to finish before issuing a new one."
             )
+        if not isinstance(flowrate, (int, float)) or float(flowrate) <= 0:
+            raise RuntimeError(
+                f"Syringe {self.name}: flowrate must be > 0 µL/min (got {flowrate!r})."
+            )
+        if not isinstance(volume, (int, float)) or float(volume) < 0:
+            raise RuntimeError(
+                f"Syringe {self.name}: volume must be >= 0 µL (got {volume!r})."
+            )
+        if isinstance(self.maxVolume, (int, float)) and float(volume) > float(self.maxVolume):
+            raise RuntimeError(
+                f"Syringe {self.name}: target volume {float(volume):.4g} µL exceeds "
+                f"max stroke {float(self.maxVolume):.4g} µL."
+            )
 
         rv = self.device.CmdSetFlowrate(flowrate)
         if rv is False:
@@ -256,6 +269,51 @@ class CSyringe:
         self.device.CmdStop()
         self.UpdateStatus()
         self.FlagReady = True
+
+    def ResetRuntimeState(self):
+        """Best-effort runtime reset after interrupted/drifted sessions.
+
+        Stops motion, refreshes status, and if the reported volume is negative,
+        attempts a safe recover-to-zero move so subsequent MoveTo calls are
+        based on a non-negative reference.
+        """
+        before = getattr(self, "volume_ul", None)
+        try:
+            self.device.CmdStop()
+        except Exception:
+            pass
+        self.UpdateStatus()
+        before = getattr(self, "volume_ul", before)
+        attempted_zero_recover = False
+        if isinstance(before, (int, float)) and float(before) < 0:
+            attempted_zero_recover = True
+            safe_flow = 100.0
+            if isinstance(self.minFlowrate, (int, float)):
+                safe_flow = max(1.0, abs(float(self.minFlowrate)))
+            try:
+                self.device.CmdSetFlowrate(float(safe_flow))
+                self.device.CmdMoveToVolume(0.0)
+                for _ in range(40):
+                    time.sleep(0.05)
+                    self.UpdateStatus()
+                    cur = getattr(self, "volume_ul", None)
+                    if isinstance(cur, (int, float)) and abs(float(cur)) <= 0.5:
+                        break
+                    if getattr(self, "FlagIsDone", False) and not getattr(self, "FlagIsMoving", False):
+                        break
+            except Exception:
+                pass
+        self.FlagStop = False
+        self.FlagReady = True
+        self.UpdateStatus()
+        return {
+            "before_volume_ul": before,
+            "after_volume_ul": getattr(self, "volume_ul", None),
+            "attempted_zero_recover": attempted_zero_recover,
+            "online": bool(getattr(self, "FlagIsOnline", False)),
+            "stalled": bool(getattr(self, "FlagIsStalled", False)),
+            "done": bool(getattr(self, "FlagIsDone", False)),
+        }
 
     ### Manual microstepping (uProcess: CmdSetStepDirection + CmdMicrostep; end with Stop)
     def BeginManualMicrostep(self, push_out: bool) -> bool:

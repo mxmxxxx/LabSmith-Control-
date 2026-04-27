@@ -933,16 +933,22 @@ class MainWindow(QtWidgets.QMainWindow):
         s_layout.addWidget(self.move_btn, 6, 0, 1, 1)
         s_layout.addWidget(self.stop_syringe_btn, 6, 1, 1, 1)
         s_layout.addWidget(self.stop_board_btn, 6, 2, 1, 2)
+        self.reset_syringe_state_btn = QtWidgets.QPushButton("Reset syringe state")
+        self.reset_syringe_state_btn.setToolTip(
+            "Stop + refresh runtime status; if current volume is negative, "
+            "attempt a safe move back to 0 µL."
+        )
+        s_layout.addWidget(self.reset_syringe_state_btn, 7, 0, 1, 4)
 
         self.monitor_status_cb = QtWidgets.QCheckBox("Live status (≈4 Hz)")
         self.monitor_status_cb.setToolTip(
             "Poll uProcess status: volume, online, moving, stall; manifold valves."
         )
-        s_layout.addWidget(self.monitor_status_cb, 7, 0, 1, 1)
+        s_layout.addWidget(self.monitor_status_cb, 8, 0, 1, 1)
         self.syringe_status_label = QtWidgets.QLabel("—")
         self.syringe_status_label.setWordWrap(True)
         self.syringe_status_label.setStyleSheet("color: #c8c8d8; font-size: 9pt;")
-        s_layout.addWidget(self.syringe_status_label, 7, 1, 1, 3)
+        s_layout.addWidget(self.syringe_status_label, 8, 1, 1, 3)
 
         self.syringe_adv_group = QtWidgets.QGroupBox(
             "Syringe advanced — microstep & 16-bit position (uProcess API)"
@@ -1097,6 +1103,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.move_btn.clicked.connect(self._on_move)
         self.stop_syringe_btn.clicked.connect(self._on_stop_syringe)
         self.stop_board_btn.clicked.connect(self._on_stop_board)
+        self.reset_syringe_state_btn.clicked.connect(self._on_reset_syringe_state)
         self.switch_btn.clicked.connect(self._on_switch)
         self.clear_log_btn.clicked.connect(self.log_edit.clear)
         self.open_logs_btn.clicked.connect(self._open_logs_folder)
@@ -1971,6 +1978,35 @@ class MainWindow(QtWidgets.QMainWindow):
             self._board.StopBoard()
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Execution error", f"Error calling StopBoard:\n{e}")
+
+    def _on_reset_syringe_state(self):
+        if self._board is None:
+            QtWidgets.QMessageBox.warning(self, "Not connected", "Please connect the board first.")
+            return
+        s = self._current_syringe()
+        if s is None:
+            QtWidgets.QMessageBox.warning(self, "Error", "Select a valid syringe.")
+            return
+        try:
+            # Clear sticky cooperative-cancel flags from previous StopBoard calls.
+            self._prepare_board_for_run()
+            status = s.ResetRuntimeState()
+            before = status.get("before_volume_ul")
+            after = status.get("after_volume_ul")
+            tried = bool(status.get("attempted_zero_recover", False))
+            QtWidgets.QMessageBox.information(
+                self,
+                "Reset syringe state",
+                "Syringe runtime state reset completed.\n\n"
+                f"Before volume: {before!r} µL\n"
+                f"After volume: {after!r} µL\n"
+                f"Zero-volume recovery attempted: {tried}",
+            )
+            self._refresh_live_hardware_status()
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(
+                self, "Execution error", f"Error resetting syringe state:\n{e}"
+            )
 
     # Manifold actions
     def _on_switch(self):
